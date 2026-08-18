@@ -1,0 +1,6 @@
+﻿personal-agent/.venv/
+personal-agent/__pycache__/
+*.pyc
+.env
+*.log
+.vscode/

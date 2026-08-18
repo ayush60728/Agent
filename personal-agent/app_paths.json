@@ -1,0 +1,37 @@
+{
+    "spotify": {
+        "path": "C:\\Users\\ayush\\AppData\\Local\\Microsoft\\WindowsApps\\spotify.EXE",
+        "last_verified": "2026-08-18",
+        "launch_count": 4
+    },
+    "visual studio": {
+        "path": "C:\\Users\\ayush\\AppData\\Roaming\\Microsoft\\Windows\\Start Menu\\Programs\\Visual Studio Code.lnk",
+        "last_verified": "2026-08-18",
+        "launch_count": 1
+    },
+    "vs code": {
+        "path": "C:\\Users\\ayush\\AppData\\Local\\Programs\\Microsoft VS Code\\Code.exe",
+        "last_verified": "2026-08-18",
+        "launch_count": 3
+    },
+    "fc": {
+        "path": "C:\\WINDOWS\\system32\\fc.EXE",
+        "last_verified": "2026-08-18",
+        "launch_count": 1
+    },
+    "brave": {
+        "path": "C:\\ProgramData\\Microsoft\\Windows\\Start Menu\\Programs\\Brave.lnk",
+        "last_verified": "2026-08-18",
+        "launch_count": 4
+    },
+    "chrome": {
+        "path": "C:\\Users\\ayush\\AppData\\Roaming\\Microsoft\\Windows\\Start Menu\\Programs\\Google Chrome.lnk",
+        "last_verified": "2026-08-18",
+        "launch_count": 1
+    },
+    "chatgpt": {
+        "path": "shell:AppsFolder\\OpenAI.Codex_2p2nqsd0c76g0!App",
+        "last_verified": "2026-08-18",
+        "launch_count": 1
+    }
+}
