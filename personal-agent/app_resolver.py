@@ -34,19 +34,6 @@ REGISTRY_LOCATIONS = [
     r"HKLM\Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall",
 ]
 
-# Common short names / nicknames users actually say, mapped to the name
-# Windows registers the app under. Extend this as you find gaps.
-ALIASES = {
-    "vs code": "visual studio code",
-    "vscode": "visual studio code",
-    "code": "visual studio code",
-    "chrome": "google chrome",
-    "word": "microsoft word",
-    "excel": "microsoft excel",
-    "powerpoint": "microsoft powerpoint",
-    "ppt": "microsoft powerpoint",
-}
-
 # Well-known default install locations, checked directly before any
 # scanning. This catches apps that don't show up cleanly in Start Menu
 # or Get-StartApps searches (VS Code is the classic example).
@@ -93,8 +80,16 @@ def _save_cache(cache: dict) -> None:
 
 
 def _path_still_valid(path_str: str) -> bool:
-    """A cached path is valid if the file/shortcut still exists,
-    OR it's a bare app name resolved from the registry (no filesystem check possible)."""
+    """A cached path is valid if the file/shortcut still exists.
+
+    'shell:AppsFolder\\<AppID>' entries (from Get-StartApps, for UWP/Store
+    apps) aren't real filesystem paths, so they can't be checked with
+    Path.exists() — we treat them as valid and let a normal launch failure
+    (handled in actions.py) trigger a rescan instead.
+    """
+    if path_str.lower().startswith("shell:"):
+        return True
+
     try:
         return Path(path_str).exists()
     except OSError:
@@ -102,7 +97,7 @@ def _path_still_valid(path_str: str) -> bool:
 
 
 def matches(target: str, candidate: str) -> bool:
-    """Fuzzy-ish name matching so 'vs code' can find 'Visual Studio Code',
+    """Fuzzy-ish name matching so close variants still resolve,
     without accidentally matching unrelated apps that merely share letters
     (e.g. 'brave' must NOT match 'rave' just because 'rave' is a substring).
 
@@ -110,8 +105,7 @@ def matches(target: str, candidate: str) -> bool:
         1. Exact match
         2. Whole-word token match (every word of the shorter name appears
            as a whole word in the longer name)
-        3. Alias expansion ("vs code" -> "visual studio code")
-        4. Similarity ratio fallback, but ONLY for longer names, since
+        3. Similarity ratio fallback, but ONLY for longer names, since
            short names collide too easily (brave/rave, code/mode, etc.)
     """
     target = normalize_name(target)
@@ -127,15 +121,9 @@ def matches(target: str, candidate: str) -> bool:
         if target_words.issubset(candidate_words) or candidate_words.issubset(target_words):
             return True
 
-    alias = ALIASES.get(target)
-    if alias:
-        alias_words = set(re.findall(r"[a-z0-9]+", alias))
-        if alias_words and (alias_words.issubset(candidate_words) or candidate_words.issubset(alias_words)):
-            return True
-
     # Fuzzy fallback only for longer names — short names (<6 chars) are
     # where false positives like brave/rave happen, so we skip fuzzy
-    # matching there entirely and rely on exact/word/alias matches only.
+    # matching there entirely and rely on exact/word matches only.
     if min(len(target), len(candidate)) >= 6:
         ratio = difflib.SequenceMatcher(None, target, candidate).ratio()
         return ratio >= 0.85
@@ -151,17 +139,13 @@ def search_known_locations(app_name: str):
     """Check well-known default install paths directly (fast, reliable)."""
     target = normalize_name(app_name)
 
-    # Match the target (or its alias) against KNOWN_LOCATIONS keys.
-    candidates = [target, ALIASES.get(target, "")]
+    if target not in KNOWN_LOCATIONS:
+        return None
 
-    for key, paths in KNOWN_LOCATIONS.items():
-        if key not in candidates:
-            continue
-
-        for raw_path in paths:
-            expanded = os.path.expandvars(raw_path)
-            if Path(expanded).exists():
-                return expanded
+    for raw_path in KNOWN_LOCATIONS[target]:
+        expanded = os.path.expandvars(raw_path)
+        if Path(expanded).exists():
+            return expanded
 
     return None
 
