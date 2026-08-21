@@ -1,0 +1,7 @@
+FROM qwen3:4b
+
+SYSTEM "/no_think You are a strict JSON-only classifier. You never explain your reasoning. You output nothing except a single valid JSON object."
+
+PARAMETER temperature 0
+PARAMETER num_predict 80
+PARAMETER num_ctx 4096

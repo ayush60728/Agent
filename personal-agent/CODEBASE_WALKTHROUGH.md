@@ -1,125 +1,270 @@
 # Personal Agent Codebase Walkthrough
 
-This repository is currently the beginning of a local-first Windows personal agent. The implemented part is a reliable application resolver and action executor for commands like:
+This repository is a local-first Windows personal agent prototype. The current working version is a typed-command agent that uses a local Ollama/Qwen model to convert user text into structured JSON actions, then executes safe local actions such as opening apps and folders.
+
+The project is not a floating desktop assistant yet, and it does not listen to voice yet. The current milestone is:
 
 ```text
-Open Brave
-Open VS Code
-Open Spotify
+typed command -> local LLM -> JSON action -> Windows executor -> confirmation
 ```
-
-The voice, LLM brain, configuration, and main agent loop files exist as placeholders, but they do not contain logic yet.
 
 ## Current File Map
 
 ```text
 personal-agent/
-  actions.py          Executes structured actions, currently open_app.
-  app_resolver.py     Finds installed Windows applications and caches paths.
-  app_paths.json      Local cache of resolved app names to launch paths.
-  test_resolver.py    Interactive CLI test for app lookup and cache behavior.
-  agent.py            Empty placeholder for the future main agent loop.
-  brain.py            Empty placeholder for local LLM parsing/planning.
-  config.py           Empty placeholder for settings and paths.
-  voice.py            Empty placeholder for speech input/output.
-  requirements.txt    Empty placeholder for Python dependencies.
+  agent.py              Main CLI agent loop, Ollama call, JSON cleanup, validation.
+  actions.py            Executes structured actions: open_app and open_folder.
+  app_resolver.py       Finds installed Windows applications and caches paths.
+  folder_resolver.py    Finds known/custom folders and caches custom folder paths.
+  prompt_cache.py       Caches prompt text -> validated action mappings.
+  app_paths.json        Local cache of resolved app launch targets.
+  folder_paths.json     Local cache of resolved custom folder paths.
+  prompt_cache.json     Local cache of repeated user prompts.
+  Modelfile             Ollama model recipe for qwen3-nothink.
+  test_resolver.py      Interactive CLI test for app lookup only.
+  brain.py              Empty placeholder; LLM logic currently lives in agent.py.
+  config.py             Empty placeholder for future settings.
+  voice.py              Empty placeholder for future speech input/output.
+  requirements.txt      Empty placeholder for Python dependencies.
 ```
 
-`__pycache__/` is generated Python bytecode and is not part of the source design.
+Generated files/folders such as `__pycache__/` and `.venv/` are not source design.
 
-## High-Level Current Flow
+## High-Level Flow
 
 ```mermaid
 flowchart TD
-    User["User types app name"]
+    User["User types command"]
+    Agent["agent.py"]
+    PromptCache["prompt_cache.py"]
+    Ollama["Ollama model qwen3-nothink"]
+    Validate["validate_action"]
     Actions["actions.py"]
-    Resolver["app_resolver.py"]
-    Cache["app_paths.json"]
-    Search["Windows search layers"]
-    Launch["os.startfile(path)"]
-    Result["Human-readable result"]
+    AppResolver["app_resolver.py"]
+    FolderResolver["folder_resolver.py"]
+    Windows["Windows os.startfile"]
+    Result["Console confirmation"]
 
-    User --> Actions
-    Actions --> Resolver
-    Resolver --> Cache
-    Cache -->|valid hit| Launch
-    Cache -->|miss or invalid| Search
-    Search --> Cache
-    Search --> Launch
-    Launch --> Result
+    User --> Agent
+    Agent --> PromptCache
+    PromptCache -->|cache hit| Validate
+    PromptCache -->|cache miss| Ollama
+    Ollama --> Validate
+    Validate --> Actions
+    Actions -->|open_app| AppResolver
+    Actions -->|open_folder| FolderResolver
+    AppResolver --> Windows
+    FolderResolver --> Windows
+    Windows --> Result
 ```
 
-At this stage, the project does not yet listen to voice or call a local LLM. Instead, `actions.py` expects a structured dictionary that looks like something the future LLM will produce:
+The important safety shape is already correct: the model does not directly control Windows. It only returns a JSON action, and local Python code decides whether that action is allowed and how to execute it.
+
+## `agent.py`
+
+`agent.py` is the current main program.
+
+Main responsibilities:
+
+- Read typed user input in a loop.
+- Ignore empty input.
+- Exit on `exit`, `quit`, `stop`, or `bye`.
+- Support `forget <phrase>` to remove a bad prompt cache entry.
+- Check `prompt_cache.json` before calling the LLM.
+- Ask the local Ollama model for a JSON action on cache miss.
+- Clean the model response defensively.
+- Parse and validate the JSON action.
+- Save newly validated actions to the prompt cache.
+- Execute the action through `actions.execute_action`.
+
+Current model:
 
 ```python
-{"action": "open_app", "target": "brave"}
+MODEL = "qwen3-nothink"
+```
+
+The file expects that this model has been created from `Modelfile`:
+
+```powershell
+ollama create qwen3-nothink -f Modelfile
+```
+
+## Agent Command Flow
+
+```mermaid
+flowchart TD
+    A["Start agent.py"]
+    B["Read user input"]
+    C{"Empty input?"}
+    D{"Exit word?"}
+    E{"Starts with forget?"}
+    F["forget_prompt"]
+    G["get_cached_action"]
+    H{"Cache hit?"}
+    I["ask_qwen"]
+    J["Clean response"]
+    K["json.loads"]
+    L["validate_action"]
+    M{"Valid action?"}
+    N["save_action if new"]
+    O["execute_action"]
+    P["Print result"]
+    Q["Stop"]
+
+    A --> B
+    B --> C
+    C -->|yes| B
+    C -->|no| D
+    D -->|yes| Q
+    D -->|no| E
+    E -->|yes| F --> B
+    E -->|no| G
+    G --> H
+    H -->|yes| L
+    H -->|no| I --> J --> K --> L
+    L --> M
+    M -->|no| B
+    M -->|yes| N --> O --> P --> B
+```
+
+## LLM Output Contract
+
+The model is instructed to output exactly one JSON object.
+
+Supported actions:
+
+```json
+{"action":"open_app","target":"brave"}
+```
+
+```json
+{"action":"open_folder","target":"downloads"}
+```
+
+`validate_action()` only allows:
+
+```python
+ALLOWED_ACTIONS = {
+    "open_app",
+    "open_folder",
+}
+```
+
+Each allowed action must include a non-empty string `target`.
+
+## `Modelfile`
+
+`Modelfile` creates a local Ollama model based on `qwen3:4b`.
+
+It bakes in a strict JSON-only system instruction and sets deterministic generation:
+
+```text
+FROM qwen3:4b
+PARAMETER temperature 0
+PARAMETER num_predict 80
+```
+
+The goal is speed and consistency, not creativity.
+
+## `prompt_cache.py`
+
+`prompt_cache.py` avoids unnecessary LLM calls for repeated commands.
+
+It stores:
+
+```text
+normalized user prompt -> validated action
+```
+
+Normalization is deliberately strict:
+
+```python
+return re.sub(r"\s+", " ", text.strip().lower())
+```
+
+There is no fuzzy matching here. That is a good safety choice because a wrong prompt-cache hit could execute the wrong action.
+
+Prompt cache flow:
+
+```mermaid
+flowchart TD
+    A["User prompt"]
+    B["normalize_prompt"]
+    C["Load prompt_cache.json"]
+    D{"Prompt exists?"}
+    E["Increment hit_count"]
+    F["Return cached action"]
+    G["Return None"]
+    H["After fresh valid LLM action"]
+    I["save_action"]
+
+    A --> B --> C --> D
+    D -->|yes| E --> F
+    D -->|no| G
+    H --> I --> C
 ```
 
 ## `actions.py`
 
-`actions.py` is the action execution layer. Its job is to take a structured action and run the correct local Windows operation.
+`actions.py` is the trusted execution layer.
 
-Implemented functions:
+Public functions:
 
 ```python
 open_app(app_name: str) -> str
+open_folder(folder_name: str) -> str
 execute_action(action: dict) -> str
 ```
 
-### `open_app`
+`execute_action()` dispatches only known action types:
 
-`open_app` takes an app name, asks `app_resolver.find_app()` to resolve it, and launches the result with `os.startfile()`.
+```text
+open_app    -> open_app(target)
+open_folder -> open_folder(target)
+```
 
-It handles:
+Both `open_app()` and `open_folder()` use the same self-healing pattern:
 
-- Missing app names.
-- Apps that cannot be found.
-- Cached paths that no longer exist.
-- Windows launch errors.
+1. Resolve the target.
+2. Try `os.startfile(path)`.
+3. If launch fails, force a rescan.
+4. Try once more.
+5. Return a readable success/failure message.
 
-Flow:
+Action execution flow:
 
 ```mermaid
 flowchart TD
-    Start["open_app(app_name)"]
-    Empty{"Is app_name empty?"}
-    Find["find_app(app_name)"]
-    Found{"Path found?"}
-    StartFile["os.startfile(path)"]
-    Success["Return: Opened app"]
-    MissingName["Return: need app name"]
-    NotFound["Return: couldn't find app"]
-    Error["Return: found app but couldn't open"]
+    A["execute_action(action)"]
+    B{"action type"}
+    C["open_app(target)"]
+    D["open_folder(target)"]
+    E["Unknown action"]
+    F["Resolve target"]
+    G{"Found?"}
+    H["os.startfile(path)"]
+    I{"Launch ok?"}
+    J["Return success"]
+    K["Force rescan and retry"]
+    L["Return failure"]
 
-    Start --> Empty
-    Empty -->|yes| MissingName
-    Empty -->|no| Find
-    Find --> Found
-    Found -->|no| NotFound
-    Found -->|yes| StartFile
-    StartFile -->|success| Success
-    StartFile -->|FileNotFoundError or OSError| Error
+    A --> B
+    B -->|open_app| C
+    B -->|open_folder| D
+    B -->|other| E
+    C --> F
+    D --> F
+    F --> G
+    G -->|no| L
+    G -->|yes| H
+    H --> I
+    I -->|yes| J
+    I -->|no| K --> H
 ```
-
-### `execute_action`
-
-`execute_action` is a dispatcher. Right now it only supports:
-
-```python
-{"action": "open_app", "target": "brave"}
-```
-
-If the action type is unknown, it returns:
-
-```text
-Unknown action: <action_type>
-```
-
-This is the right shape for the future system because the LLM should not directly control the computer. The LLM should produce structured intent, and this executor should decide what is actually allowed to run.
 
 ## `app_resolver.py`
 
-`app_resolver.py` is the most complete module in the codebase. It turns a human app name into something Windows can launch.
+`app_resolver.py` resolves application names to launchable Windows targets.
 
 Main public functions:
 
@@ -128,307 +273,269 @@ find_app(app_name: str, force_rescan: bool = False)
 forget_app(app_name: str)
 ```
 
-Supporting functions:
+Search order:
 
-```python
-normalize_name(name)
-matches(target, candidate)
-search_known_locations(app_name)
-search_start_menu(app_name)
-search_path(app_name)
-search_start_apps(app_name)
-search_registry(app_name)
-```
+1. `app_paths.json` cache.
+2. Known install locations.
+3. Start Menu shortcuts.
+4. Windows PATH.
+5. PowerShell `Get-StartApps`.
+6. Windows uninstall registry.
 
-## App Resolution Flow
+App resolver flow:
 
 ```mermaid
 flowchart TD
     A["find_app(app_name)"]
-    B["normalize app name"]
-    C["load app_paths.json"]
-    D{"Cache hit and not force_rescan?"}
-    E{"Cached path still valid?"}
-    F["Return cached path"]
-    G["Search known install locations"]
-    H["Search Start Menu shortcuts"]
-    I["Search PATH"]
-    J["Search Get-StartApps"]
-    K["Search uninstall registry"]
-    L{"Found result?"}
-    M["Save result to cache"]
-    N["Return result"]
-    O["Return None"]
+    B["normalize_name"]
+    C["Load app_paths.json"]
+    D{"Cache hit and valid?"}
+    E["Return cached target"]
+    F["Search known locations"]
+    G["Search Start Menu"]
+    H["Search PATH"]
+    I["Search Get-StartApps"]
+    J["Search Registry"]
+    K{"Found?"}
+    L["Save to cache"]
+    M["Return target"]
+    N["Return None"]
 
     A --> B --> C --> D
     D -->|yes| E
-    E -->|yes| F
-    E -->|no| G
-    D -->|no| G
-    G --> L
-    H --> L
-    I --> L
-    J --> L
-    K --> L
-    L -->|yes| M --> N
-    L -->|no, try next layer| H
-    H -->|not found| I
-    I -->|not found| J
-    J -->|not found| K
-    K -->|not found| O
+    D -->|no| F --> K
+    K -->|yes| L --> M
+    K -->|no| G --> H --> I --> J --> N
 ```
 
-## Search Layers
+Supported launch target types:
 
-The resolver searches from most reliable/fastest to broadest/fallback.
+- Normal executable path.
+- Start Menu `.lnk` shortcut.
+- `.url` shortcut.
+- `shell:AppsFolder\<AppID>` for Store/UWP-style apps.
 
-### 1. Cache
+Important current behavior: this file does not contain a separate alias map. Matching is based on normalization, whole-word token matching, and fuzzy matching only for names where both strings are at least 6 characters long.
 
-`app_paths.json` stores resolved app paths:
-
-```json
-{
-  "brave": {
-    "path": "C:\\ProgramData\\Microsoft\\Windows\\Start Menu\\Programs\\Brave.lnk",
-    "last_verified": "2026-08-18",
-    "launch_count": 4
-  }
-}
-```
-
-The cache improves speed after the first lookup. Each successful cached launch increments `launch_count`.
-
-### 2. Known Install Locations
-
-`KNOWN_LOCATIONS` stores special-case paths for apps that are often hard to discover, currently Visual Studio Code:
-
-```python
-"visual studio code": [
-    r"%LOCALAPPDATA%\Programs\Microsoft VS Code\Code.exe",
-    r"%PROGRAMFILES%\Microsoft VS Code\Code.exe",
-    r"%PROGRAMFILES(X86)%\Microsoft VS Code\Code.exe",
-]
-```
-
-### 3. Start Menu
-
-The resolver scans Start Menu folders for `.lnk` and `.url` files:
-
-```text
-%APPDATA%\Microsoft\Windows\Start Menu\Programs
-%PROGRAMDATA%\Microsoft\Windows\Start Menu\Programs
-```
-
-This is useful because many Windows apps are launchable through shortcuts even when their executable path is not obvious.
-
-### 4. PATH
-
-`search_path` uses `shutil.which()` to find command-line executables available in the Windows PATH.
-
-### 5. Get-StartApps
-
-`search_start_apps` runs PowerShell:
-
-```powershell
-Get-StartApps | ConvertTo-Json
-```
-
-If an app is found, it returns a launchable shell identifier:
-
-```text
-shell:AppsFolder\<AppID>
-```
-
-This helps with Microsoft Store/UWP-style apps.
-
-### 6. Registry
-
-`search_registry` checks uninstall registry entries for display names. This can confirm that an app is installed, but it may return only a display name rather than a launchable executable path. Because of that, it is correctly used as a last resort.
-
-## Name Matching
-
-The resolver has a custom `matches(target, candidate)` function to avoid bad fuzzy matches.
-
-It checks in this order:
+## App Name Matching
 
 ```mermaid
 flowchart TD
     A["matches(target, candidate)"]
     B["normalize both names"]
     C{"Exact match?"}
-    D{"Whole-word token match?"}
-    E{"Alias match?"}
-    F{"Both names length >= 6?"}
-    G{"Similarity >= 0.85?"}
-    H["Return True"]
-    I["Return False"]
+    D{"Whole-word subset match?"}
+    E{"Both names length >= 6?"}
+    F{"Similarity >= 0.85?"}
+    G["True"]
+    H["False"]
 
     A --> B --> C
-    C -->|yes| H
+    C -->|yes| G
     C -->|no| D
-    D -->|yes| H
+    D -->|yes| G
     D -->|no| E
-    E -->|yes| H
-    E -->|no| F
-    F -->|no| I
+    E -->|no| H
+    E -->|yes| F
     F -->|yes| G
-    G -->|yes| H
-    G -->|no| I
+    F -->|no| H
 ```
 
-This is important because short app names can collide easily. For example, fuzzy matching could incorrectly match `brave` with `rave`, so the code only uses similarity fallback when both names are at least 6 characters long.
+This avoids many short-name false positives such as matching `brave` with `rave`.
 
-Current aliases:
+## `folder_resolver.py`
+
+`folder_resolver.py` resolves folder names to real directories.
+
+Main public functions:
 
 ```python
-{
-    "vs code": "visual studio code",
-    "vscode": "visual studio code",
-    "code": "visual studio code",
-    "chrome": "google chrome",
-    "word": "microsoft word",
-    "excel": "microsoft excel",
-    "powerpoint": "microsoft powerpoint",
-    "ppt": "microsoft powerpoint",
-}
+find_folder(folder_name: str, force_rescan: bool = False)
+forget_folder(folder_name: str)
+```
+
+Search order:
+
+1. Known Windows folders.
+2. `folder_paths.json` cache.
+3. Common user locations.
+4. Full drive scan as a last resort.
+
+Known folders include:
+
+```text
+downloads
+documents
+desktop
+pictures
+music
+videos
+home
+user
+appdata
+local appdata
+roaming
+```
+
+Custom folder search now limits common-location scanning to:
+
+```python
+MAX_COMMON_SEARCH_DEPTH = 3
+```
+
+It also skips noisy/system/cache folders:
+
+```text
+windows
+$recycle.bin
+system volume information
+node_modules
+.git
+programdata
+appdata
+program files
+program files (x86)
+.cache
+.venv
+__pycache__
+codex-runtimes
+```
+
+Folder resolver flow:
+
+```mermaid
+flowchart TD
+    A["find_folder(folder_name)"]
+    B["Check known Windows folders"]
+    C{"Known folder found?"}
+    D["Return known folder path"]
+    E["Normalize folder name"]
+    F["Load folder_paths.json"]
+    G{"Cache hit and valid?"}
+    H["Return cached path"]
+    I["Search common locations up to depth 3"]
+    J{"Found?"}
+    K["Full drive scan"]
+    L{"Found?"}
+    M["Save to cache"]
+    N["Return path"]
+    O["Return None"]
+
+    A --> B --> C
+    C -->|yes| D
+    C -->|no| E --> F --> G
+    G -->|yes| H
+    G -->|no| I --> J
+    J -->|yes| M --> N
+    J -->|no| K --> L
+    L -->|yes| M --> N
+    L -->|no| O
 ```
 
 ## `test_resolver.py`
 
-`test_resolver.py` is an interactive CLI tool for testing only the resolver.
+`test_resolver.py` is an interactive test program for `app_resolver.py`.
 
 Supported commands:
 
 ```text
 <app name>          Resolve an app normally.
 rescan <app name>   Ignore cache and search again.
-forget <app name>   Remove the app from app_paths.json.
+forget <app name>   Remove app from app_paths.json.
 quit / exit         Stop the test program.
 ```
 
-Flow:
+It does not test folders or the full agent loop.
 
-```mermaid
-flowchart TD
-    A["Start test_resolver.py"]
-    B["Read user input"]
-    C{"quit or exit?"}
-    D{"starts with forget?"}
-    E{"starts with rescan?"}
-    F["forget_app(name)"]
-    G["find_app(name, force_rescan=True)"]
-    H["find_app(name)"]
-    I["Print found path or not found"]
-    J["End"]
+## Cache Files
 
-    A --> B
-    B --> C
-    C -->|yes| J
-    C -->|no| D
-    D -->|yes| F --> B
-    D -->|no| E
-    E -->|yes| G --> I --> B
-    E -->|no| H --> I --> B
+The three JSON cache files are local machine state, not portable app configuration.
+
+### `app_paths.json`
+
+Stores app launch targets:
+
+```json
+{
+  "brave": {
+    "path": "C:\\ProgramData\\Microsoft\\Windows\\Start Menu\\Programs\\Brave.lnk",
+    "last_verified": "2026-08-18",
+    "launch_count": 10
+  }
+}
 ```
 
-## Current Cache Contents
+### `folder_paths.json`
 
-`app_paths.json` currently contains cached entries for:
+Stores custom folder paths. It is currently empty:
 
-- Spotify
-- Visual Studio
-- VS Code
-- fc
-- Brave
-- Chrome
-- ChatGPT/Codex app
-
-These cache entries are local to this Windows machine and should not be treated as portable configuration.
-
-## Placeholder Files
-
-These files currently exist but are empty:
-
-```text
-agent.py
-brain.py
-config.py
-requirements.txt
-voice.py
+```json
+{}
 ```
 
-Expected future roles:
+Known Windows folders bypass this cache.
 
-```text
-agent.py       Main runtime loop: voice/text input -> brain -> actions -> response.
-brain.py       Local LLM integration and structured action generation.
-config.py      Model names, app settings, safety flags, storage paths.
-voice.py       Local speech-to-text and text-to-speech.
-requirements.txt Python dependencies.
+### `prompt_cache.json`
+
+Stores prompt classifications:
+
+```json
+{
+  "open brave": {
+    "action": {
+      "action": "open_app",
+      "target": "brave"
+    },
+    "last_used": "2026-08-19",
+    "hit_count": 2
+  }
+}
 ```
 
-## Intended Future Agent Flow
-
-This is not implemented yet, but it matches the project direction:
-
-```mermaid
-flowchart TD
-    User["User"]
-    Voice["voice.py: speech-to-text"]
-    Agent["agent.py: main loop"]
-    Brain["brain.py: local LLM intent parser"]
-    Safety["security/permissions layer"]
-    Actions["actions.py: action dispatcher"]
-    Resolver["app_resolver.py: app lookup"]
-    Windows["Windows automation"]
-    Response["voice.py/UI confirmation"]
-
-    User --> Voice
-    Voice --> Agent
-    Agent --> Brain
-    Brain --> Safety
-    Safety --> Actions
-    Actions --> Resolver
-    Actions --> Windows
-    Resolver --> Windows
-    Windows --> Response
-    Response --> User
-```
-
-For the MVP command `Open Brave`, the eventual flow should be:
+## Current MVP Sequence
 
 ```mermaid
 sequenceDiagram
     participant U as User
-    participant V as Voice
-    participant A as Agent
-    participant B as Brain
-    participant X as Actions
-    participant R as Resolver
+    participant A as agent.py
+    participant C as prompt_cache.py
+    participant Q as Ollama Qwen
+    participant X as actions.py
+    participant R as resolver
     participant W as Windows
 
-    U->>V: "Open Brave"
-    V->>A: open brave
-    A->>B: Parse command
-    B->>A: {"action":"open_app","target":"brave"}
+    U->>A: open brave
+    A->>C: get_cached_action("open brave")
+    alt Cache hit
+        C->>A: {"action":"open_app","target":"brave"}
+    else Cache miss
+        A->>Q: classify as JSON action
+        Q->>A: {"action":"open_app","target":"brave"}
+        A->>C: save_action(...)
+    end
+    A->>A: validate_action(...)
     A->>X: execute_action(...)
     X->>R: find_app("brave")
-    R->>X: Brave shortcut path
-    X->>W: os.startfile(path)
-    X->>A: Opened Brave.
-    A->>U: Confirmation
+    R->>X: Brave launch target
+    X->>W: os.startfile(target)
+    X->>A: Opened brave.
+    A->>U: Print confirmation
 ```
 
 ## What Is Working Now
 
-The current project can already:
+The current project can:
 
-- Resolve Windows applications by name.
-- Cache discovered launch paths.
-- Use aliases like `vs code` and `chrome`.
-- Launch normal paths, shortcuts, URLs, and shell app identifiers.
-- Forget cached apps.
-- Force a rescan when needed.
+- Accept typed commands in a CLI loop.
+- Use a local Ollama/Qwen model for JSON action classification.
+- Cache repeated prompt classifications.
+- Validate allowed action types before execution.
+- Open Windows applications.
+- Open known Windows folders.
+- Search for custom folders.
+- Cache app and custom folder paths.
+- Rescan stale app/folder paths once if launch fails.
+- Forget bad prompt and resolver cache entries through helper functions.
 
 ## What Is Not Built Yet
 
@@ -436,28 +543,34 @@ The current project does not yet include:
 
 - Voice recognition.
 - Wake word detection.
-- Local LLM calls.
-- Planner logic beyond simple action dispatch.
+- Text-to-speech.
 - Floating desktop UI.
-- OCR or screen understanding.
-- Memory database.
-- Skills/workflow recording.
+- Screen capture, OCR, or vision understanding.
+- Long-term memory database.
+- Skill/workflow recording.
 - Sandbox mode.
-- Permission levels.
+- Permission levels beyond basic action validation.
 - Audit logs.
+
+## Known Cleanup Notes
+
+- `brain.py` is empty even though the LLM logic currently lives in `agent.py`. Later, moving model/classification code into `brain.py` would make the structure cleaner.
+- `requirements.txt` is empty even though the project uses `ollama`.
+- Some console strings contain mojibake characters from encoding issues. They do not block execution, but they make terminal output look corrupted.
+- The local `.venv` appears broken on this machine. Syntax verification was done with Codex's bundled Python instead.
 
 ## Recommended Next Build Step
 
-The next useful step is to connect the existing executor to a tiny `agent.py` loop:
+The next clean step is to split responsibilities without adding new features:
 
 ```text
-User types command
-  -> simple rule parser
-  -> structured action
-  -> execute_action
-  -> print result
+agent.py -> input loop and orchestration
+brain.py -> ask_qwen, JSON cleanup, validate_action
+actions.py -> trusted execution
 ```
 
-After that works, replace typed input with local speech-to-text, then replace the rule parser with a local LLM.
+After that, add `requirements.txt`, then build the first voice path:
 
-The codebase already has the right first brick: a practical Windows application resolver. The next job is to wrap it in an agent loop without making the system too large too early.
+```text
+microphone -> local speech-to-text -> existing agent action flow
+```
