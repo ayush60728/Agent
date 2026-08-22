@@ -19,27 +19,38 @@ The agent is designed for Windows and currently executes one structured action p
 
 ## Architecture
 
-```text
-Typed or spoken command
-        |
-        v
-agent.py
-  |  prompt_cache.py  (exact normalized prompt cache)
-  |  Ollama / qwen3-nothink  (cache miss)
-  v
-JSON parsing and action validation
-        |
-        v
-actions.py  (trusted dispatcher)
-  |       |          |
-  v       v          v
-Resolvers  OCR/input  wait/focus
-        |
-        v
-Windows applications, folders, and foreground windows
+```mermaid
+flowchart TD
+    Input["Typed or spoken command"] --> Agent["agent.py"]
+    Agent --> Cache["prompt_cache.py<br/>exact normalized prompt"]
+    Cache -->|cache hit| Validate["Parse and validate action"]
+    Cache -->|cache miss| Ollama["Ollama<br/>qwen3-nothink"]
+    Ollama --> Validate
+    Validate --> Actions["actions.py<br/>trusted dispatcher"]
+    Actions --> AppResolver["app_resolver.py"]
+    Actions --> FolderResolver["folder_resolver.py"]
+    Actions --> Desktop["desktop_actions.py<br/>OCR and simulated input"]
+    Actions --> Wait["wait"]
+    AppResolver --> Windows["Windows applications and folders"]
+    FolderResolver --> Windows
+    Desktop --> Windows
+    Wait --> Windows
 ```
 
 The model does not directly control Windows. It is asked for one JSON action, `agent.py` validates that action against an allowlist, and `actions.py` performs the local operation.
+
+Voice mode and the optional desktop pet use a small JSON file as their shared state channel:
+
+```mermaid
+flowchart LR
+    Mic["Microphone"] --> Voice["voice_io.py<br/>wake word + Faster Whisper"]
+    Voice --> Command["agent.py<br/>process_command"]
+    Command --> Reply["pyttsx3 response"]
+    Reply --> Voice
+    Voice --> State["agent_state.json"]
+    State --> Pet["pet_ui.py<br/>Tkinter overlay"]
+    Voice --> Log["voice_log.json"]
+```
 
 ## Project Layout
 
