@@ -15,6 +15,7 @@ that works for a single-user local app running two processes.
 """
 
 import io
+import itertools
 import json
 import re
 import time
@@ -22,7 +23,6 @@ import threading
 from pathlib import Path
 
 import numpy as np
-import soundfile as sf
 import speech_recognition as sr
 import pyttsx3
 from faster_whisper import WhisperModel
@@ -71,6 +71,34 @@ MIC_DEVICE_INDEX = None
 # Tunable: raise NO_SPEECH_MAX / lower AVG_LOGPROB_MIN if real speech gets cut.
 NO_SPEECH_MAX = 0.6      # skip segments with no_speech_prob above this
 AVG_LOGPROB_MIN = -1.0   # skip segments the model was very unsure about
+
+# When Whisper is fed background media/voices (not near-silence — the VAD lets
+# those through), it tends to loop a phrase: "bye-bye. bye-bye. bye-bye." or
+# "whole thing whole thing whole thing". That repetition compresses extremely
+# well, so a high compression_ratio is a reliable "this is a hallucination, not
+# a command" signal. 2.4 is Whisper's own default threshold; clean speech sits
+# well under 1.0 (our test clip: 0.62), so this never touches real commands.
+COMPRESSION_RATIO_MAX = 2.4
+
+# If, after filtering, the *entire* transcript is just one of Whisper's stock
+# noise-fillers, treat it as nothing heard. These are never a real command or
+# the wake word, so dropping them keeps the log readable and stops the agent
+# reacting to room noise. Matched against a normalized (punctuation-stripped)
+# transcript, and only as a whole — "wait" stays a valid command, and filler
+# appearing *inside* a real sentence is left alone.
+_NOISE_FILLERS = {
+    "you", "thank you", "thanks", "thanks for watching", "thank you for watching",
+    "bye", "bye-bye", "goodbye", "oh", "okay", "ok", "uh", "um",
+    "mm", "mmm", "mm-hmm", "mhm", "hmm", "youre welcome",
+}
+
+# How long the idle wake-word listen waits for speech to START before it gives
+# up and loops (to animate the "listening…" heartbeat). It does NOT cut off
+# speech already in progress — phrase_time_limit handles that, and the mic is
+# held open across calls so no speech falls through the gap. Keep it short so
+# the terminal visibly ticks a couple of times a second; a silence timeout is
+# cheap (it never reaches Whisper), so a low value costs almost nothing.
+WAKE_LISTEN_TIMEOUT = 1.5
 
 # "base.en" = small, fast on CPU, good enough for short commands.
 # Bump to "small.en" / "medium.en" if you have a GPU and want more accuracy.
@@ -147,31 +175,77 @@ def _transcribe(audio: sr.AudioData) -> str:
     was very unsure about (low avg_logprob) are dropped, so room noise doesn't
     come back as phantom filler words. If everything gets filtered out we return
     "" — the caller treats that as "nothing intelligible was said"."""
-    wav_bytes = audio.get_wav_data()
-    data, _samplerate = sf.read(io.BytesIO(wav_bytes), dtype="float32")
-
+    # Hand the raw WAV bytes to faster-whisper as a file-like object and let IT
+    # decode them. This is load-bearing: Whisper models only understand 16 kHz
+    # audio, and faster-whisper's internal decoder resamples to 16 kHz for us.
+    # The mic records at its native rate (44.1/48 kHz), so if we decode the WAV
+    # ourselves (e.g. sf.read -> numpy array) and pass that array in, Whisper
+    # treats those 44.1k samples as if they were 16k and recognises *nothing* —
+    # that was the "capturing audio but couldn't make out words" bug.
     segments, _info = _whisper_model.transcribe(
-        data, language="en", beam_size=1, vad_filter=True,
+        io.BytesIO(audio.get_wav_data()), language="en", beam_size=1, vad_filter=True,
     )
 
     kept = [
         seg.text
         for seg in segments
-        if seg.no_speech_prob <= NO_SPEECH_MAX and seg.avg_logprob >= AVG_LOGPROB_MIN
+        if seg.no_speech_prob <= NO_SPEECH_MAX
+        and seg.avg_logprob >= AVG_LOGPROB_MIN
+        and getattr(seg, "compression_ratio", 0.0) <= COMPRESSION_RATIO_MAX
     ]
-    return " ".join(kept).strip()
+    text = " ".join(kept).strip()
+
+    # Final guard: if what survived is nothing but a stock noise-filler
+    # ("you", "thank you", "bye", "mmm"), report nothing heard. Normalize the
+    # same way the wake-word matcher does (drop punctuation, collapse spaces,
+    # lowercase) so "Thank you." and "thank you" both match.
+    normalized = re.sub(r"[^a-z0-9\s-]", "", text.lower())
+    normalized = re.sub(r"\s+", " ", normalized).strip()
+    if normalized in _NOISE_FILLERS:
+        return ""
+
+    return text
 
 
-def _listen_once(recognizer: sr.Recognizer, mic: sr.Microphone, phrase_time_limit: float) -> str:
-    """Block for a single phrase, return its transcript (possibly empty
-    if nothing intelligible was captured)."""
-    with mic as source:
-        try:
-            audio = recognizer.listen(source, timeout=None, phrase_time_limit=phrase_time_limit)
-        except sr.WaitTimeoutError:
-            return ""
+def _listen_on_source(
+    recognizer: sr.Recognizer,
+    source: sr.AudioSource,
+    phrase_time_limit: float,
+    timeout: float | None = None,
+) -> str | None:
+    """Capture a single phrase from an already-open mic source and return its
+    transcript. Returns "" if a phrase was captured but nothing intelligible
+    came out of it, or None if `timeout` elapsed with no speech at all — the
+    caller uses None as its "still listening, nothing happened" heartbeat tick.
 
+    The source is opened once by the caller and reused across calls, so there's
+    no gap between phrases where speech could be missed (re-opening the device
+    every loop, as the old code did, dropped the first moment of each utterance)."""
+    try:
+        audio = recognizer.listen(source, timeout=timeout, phrase_time_limit=phrase_time_limit)
+    except sr.WaitTimeoutError:
+        return None
     return _transcribe(audio)
+
+
+def _drain(source: sr.AudioSource) -> None:
+    """Throw away any audio already buffered on the open mic stream.
+
+    We keep the mic open for the whole session (see voice_loop), so while the
+    agent is busy thinking or speaking, the input stream quietly piles up
+    samples — including the agent's own TTS if the mic can hear the speakers.
+    Draining right after we act means the next listen() starts from live audio
+    instead of replaying that backlog (which would otherwise get transcribed as
+    a phantom 'utterance', sometimes the agent hearing itself). Best-effort."""
+    try:
+        stream = source.stream.pyaudio_stream
+        for _ in range(64):  # bounded so a misbehaving driver can't wedge us here
+            available = stream.get_read_available()
+            if available <= 0:
+                break
+            source.stream.read(available)
+    except Exception:
+        pass
 
 
 def _find_wake_word(transcript: str) -> str | None:
@@ -230,8 +304,20 @@ def mic_check(recognizer: sr.Recognizer, mic: sr.Microphone, seconds: float = 3.
     if transcript:
         print(f"   ✓ Mic OK — heard: '{transcript}'\n")
     else:
-        print("   ✓ Mic is capturing audio, but I couldn't make out words —")
-        print("     speak a bit louder/clearer when giving commands.\n")
+        # Audio is coming in, but Whisper found no real speech in it. At a
+        # low-but-nonzero level this almost always means the mic is picking up
+        # faint room/background audio rather than your voice up close — which is
+        # exactly what makes the wake word never trigger (the log fills with
+        # hallucinated phrases instead of your commands).
+        print("   ✓ Mic is capturing audio, but I couldn't make out words.")
+        if rms < 800:
+            print(f"     Level is low (rms {rms:.0f}) — this looks like background/far-field")
+            print("     sound, not close speech. Try: speak directly into the mic, or")
+            print("     pick the right input device -> python agent.py --list-mics")
+            print("     then run: python agent.py --mic <index> --voice")
+        else:
+            print("     Speak a bit louder/clearer when giving commands.")
+        print()
     return True
 
 
@@ -271,55 +357,90 @@ def voice_loop(on_command):
     mic_check(recognizer, mic)
 
     _write_state("idle")
-    print(f"Listening for wake word '{WAKE_WORD}'...")
+    print(f"Listening for wake word '{WAKE_WORD}'... (Ctrl+C to stop)\n")
 
-    while True:
-        _write_state("idle")
+    # Braille spinner so the terminal visibly "breathes" while idle-listening —
+    # otherwise a working-but-quiet mic looks identical to a frozen program.
+    spinner = itertools.cycle("⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏")
 
-        transcript = _listen_once(recognizer, mic, phrase_time_limit=5)
-        transcript_lower = transcript.lower().strip()
+    def _heartbeat():
+        # Overwrite one line in place (\r, no newline) so the heartbeat animates
+        # rather than scrolling. Trailing spaces clear any longer previous line.
+        print(f"\r  {next(spinner)} listening for '{WAKE_WORD}'…    ", end="", flush=True)
 
-        # Debug visibility: show every heard phrase, not just ones that
-        # matched the wake word — otherwise a silent mic and a working-
-        # but-unheard mic look identical from the terminal.
-        if transcript_lower:
-            print(f"(heard: '{transcript_lower}')")
+    # Open the mic ONCE and keep it open for the whole session. Every listen()
+    # below reuses this same stream — no per-phrase re-open, so we never miss the
+    # start of an utterance, and short timeouts let us animate the heartbeat.
+    with mic as source:
+        while True:
+            _write_state("idle")
+
+            # Short timeout so that during silence we regain control every few
+            # seconds to tick the heartbeat; returns None on a pure-silence timeout.
+            transcript = _listen_on_source(
+                recognizer, source, phrase_time_limit=5, timeout=WAKE_LISTEN_TIMEOUT
+            )
+
+            if not transcript:
+                # None (silence) or "" (caught noise, nothing intelligible) —
+                # either way we're alive and still waiting. Keep the heartbeat going.
+                _heartbeat()
+                continue
+
+            transcript_lower = transcript.lower().strip()
+            if not transcript_lower:
+                _heartbeat()
+                continue
+
+            # Got real words — finish the heartbeat line (leading \r + padding
+            # overwrites the spinner) and drop to normal scrolling output.
+            print(f"\r(heard: '{transcript_lower}')                    ")
             log_utterance(transcript_lower, kind="heard")
 
-        # Use the fuzzy alias matcher instead of a naive substring check.
-        # This catches Whisper mishearings like "asian", "ancient", etc.
-        matched_wake = _find_wake_word(transcript_lower)
+            # Use the fuzzy alias matcher instead of a naive substring check.
+            # This catches Whisper mishearings like "asian", "ancient", etc.
+            matched_wake = _find_wake_word(transcript_lower)
 
-        if matched_wake is None:
-            # Also let through obvious commands even without a wake word.
-            if _looks_like_direct_command(transcript_lower):
-                matched_wake = ""  # treat entire transcript as command
+            if matched_wake is None:
+                # Also let through obvious commands even without a wake word.
+                if _looks_like_direct_command(transcript_lower):
+                    matched_wake = ""  # treat entire transcript as command
+                else:
+                    continue  # not addressed to us — stay idle, keep listening
+
+            _write_state("listening")
+
+            # "agent open brave" — command already in the same utterance.
+            if matched_wake and matched_wake in transcript_lower:
+                after_wake = transcript_lower.split(matched_wake, 1)[1].strip()
             else:
-                continue  # not addressed to us — stay idle, keep listening
+                # Direct command (no wake word) — entire transcript is the command.
+                after_wake = transcript_lower
 
-        _write_state("listening")
+            if after_wake:
+                command_text = after_wake
+            else:
+                # Just "agent" was said alone — do a dedicated follow-up listen
+                # on the same open source. Wait a bit longer here since the user
+                # is expected to be about to speak.
+                print("  (yes? — listening for your command…)")
+                command_text = _listen_on_source(
+                    recognizer, source, phrase_time_limit=6, timeout=6
+                )
 
-        # "agent open brave" — command already in the same utterance.
-        if matched_wake and matched_wake in transcript_lower:
-            after_wake = transcript_lower.split(matched_wake, 1)[1].strip()
-        else:
-            # Direct command (no wake word) — entire transcript is the command.
-            after_wake = transcript_lower
+            if not command_text:
+                continue
 
-        if after_wake:
-            command_text = after_wake
-        else:
-            # Just "agent" was said alone — do a dedicated follow-up listen.
-            command_text = _listen_once(recognizer, mic, phrase_time_limit=6)
+            print(f"You (voice): {command_text}")
+            log_utterance(command_text, kind="command")
 
-        if not command_text:
-            continue
+            _write_state("thinking")
+            reply = on_command(command_text)
 
-        print(f"You (voice): {command_text}")
-        log_utterance(command_text, kind="command")
+            if reply:
+                speak(reply)
 
-        _write_state("thinking")
-        reply = on_command(command_text)
-
-        if reply:
-            speak(reply)
+            # Discard whatever piled up on the stream while we were thinking /
+            # speaking, so we don't immediately "hear" our own reply or stale
+            # noise on the next pass.
+            _drain(source)

@@ -1,0 +1,266 @@
+{
+    "open brave": {
+        "action": {
+            "action": "open_app",
+            "target": "brave"
+        },
+        "last_used": "2026-08-19",
+        "hit_count": 13
+    },
+    "can you open brave": {
+        "action": {
+            "action": "open_app",
+            "target": "brave"
+        },
+        "last_used": "2026-08-19",
+        "hit_count": 0
+    },
+    "i wanna scroll youtube open brave": {
+        "action": {
+            "action": "open_app",
+            "target": "brave"
+        },
+        "last_used": "2026-08-19",
+        "hit_count": 0
+    },
+    "open spotify": {
+        "action": {
+            "action": "open_app",
+            "target": "spotify"
+        },
+        "last_used": "2026-08-19",
+        "hit_count": 2
+    },
+    "open teampr presetation": {
+        "action": {
+            "action": "open_app",
+            "target": "teampr presetation"
+        },
+        "last_used": "2026-08-19",
+        "hit_count": 0
+    },
+    "open teampr file": {
+        "action": {
+            "action": "open_folder",
+            "target": "teampr file"
+        },
+        "last_used": "2026-08-19",
+        "hit_count": 1
+    },
+    "open myasus": {
+        "action": {
+            "action": "open_app",
+            "target": "myasus"
+        },
+        "last_used": "2026-08-19",
+        "hit_count": 0
+    },
+    "myasus": {
+        "action": {
+            "action": "open_app",
+            "target": "myasus"
+        },
+        "last_used": "2026-08-19",
+        "hit_count": 0
+    },
+    "open xbox": {
+        "action": {
+            "action": "open_app",
+            "target": "xbox"
+        },
+        "last_used": "2026-08-19",
+        "hit_count": 1
+    },
+    "open agent folder": {
+        "action": {
+            "action": "open_folder",
+            "target": "agent folder"
+        },
+        "last_used": "2026-08-19",
+        "hit_count": 0
+    },
+    "opem youtube": {
+        "action": {
+            "action": "open_app",
+            "target": "youtube"
+        },
+        "last_used": "2026-08-19",
+        "hit_count": 0
+    },
+    "click search": {
+        "action": {
+            "action": "click_text",
+            "target": "search"
+        },
+        "last_used": "2026-08-19",
+        "hit_count": 0
+    },
+    "type youtube.com": {
+        "action": {
+            "action": "type_text",
+            "target": "youtube.com"
+        },
+        "last_used": "2026-08-19",
+        "hit_count": 3
+    },
+    "press enter": {
+        "action": {
+            "action": "press_key",
+            "target": "enter"
+        },
+        "last_used": "2026-08-19",
+        "hit_count": 0
+    },
+    "oepn brave": {
+        "action": {
+            "action": "open_app",
+            "target": "brave"
+        },
+        "last_used": "2026-08-19",
+        "hit_count": 0
+    },
+    "click on search": {
+        "action": {
+            "action": "click_text",
+            "target": "search"
+        },
+        "last_used": "2026-08-19",
+        "hit_count": 6
+    },
+    "type youtube": {
+        "action": {
+            "action": "type_text",
+            "target": "youtube"
+        },
+        "last_used": "2026-08-19",
+        "hit_count": 1
+    },
+    "youtube": {
+        "action": {
+            "action": "open_app",
+            "target": "youtube"
+        },
+        "last_used": "2026-08-19",
+        "hit_count": 0
+    },
+    "click on play": {
+        "action": {
+            "action": "click_text",
+            "target": "play"
+        },
+        "last_used": "2026-08-19",
+        "hit_count": 0
+    },
+    "search": {
+        "action": {
+            "action": "click_text",
+            "target": "search"
+        },
+        "last_used": "2026-08-19",
+        "hit_count": 0
+    },
+    "click on chatgpt": {
+        "action": {
+            "action": "click_text",
+            "target": "chatgpt"
+        },
+        "last_used": "2026-08-19",
+        "hit_count": 1
+    },
+    "come back": {
+        "action": {
+            "action": "focus_app",
+            "target": "come back"
+        },
+        "last_used": "2026-08-19",
+        "hit_count": 0
+    },
+    "come back to previous tab": {
+        "action": {
+            "action": "focus_app",
+            "target": "previous tab"
+        },
+        "last_used": "2026-08-19",
+        "hit_count": 0
+    },
+    "go back": {
+        "action": {
+            "action": "focus_app",
+            "target": "go back"
+        },
+        "last_used": "2026-08-19",
+        "hit_count": 0
+    },
+    "type youtbe": {
+        "action": {
+            "action": "type_text",
+            "target": "youtbe"
+        },
+        "last_used": "2026-08-19",
+        "hit_count": 0
+    },
+    "clicl ctrl+a": {
+        "action": {
+            "action": "press_key",
+            "target": "ctrl+a"
+        },
+        "last_used": "2026-08-19",
+        "hit_count": 0
+    },
+    "click delete": {
+        "action": {
+            "action": "click_text",
+            "target": "delete"
+        },
+        "last_used": "2026-08-19",
+        "hit_count": 0
+    },
+    "click backspace": {
+        "action": {
+            "action": "press_key",
+            "target": "backspace"
+        },
+        "last_used": "2026-08-19",
+        "hit_count": 0
+    },
+    "hit enter": {
+        "action": {
+            "action": "press_key",
+            "target": "enter"
+        },
+        "last_used": "2026-08-19",
+        "hit_count": 0
+    },
+    "click ctrl+l": {
+        "action": {
+            "action": "press_key",
+            "target": "ctrl+l"
+        },
+        "last_used": "2026-08-19",
+        "hit_count": 0
+    },
+    "press ctrl+l": {
+        "action": {
+            "action": "press_key",
+            "target": "ctrl+l"
+        },
+        "last_used": "2026-08-19",
+        "hit_count": 0
+    },
+    "open outlook": {
+        "action": {
+            "action": "open_app",
+            "target": "outlook"
+        },
+        "last_used": "2026-08-22",
+        "hit_count": 0
+    },
+    "open word": {
+        "action": {
+            "action": "open_app",
+            "target": "word"
+        },
+        "last_used": "2026-08-22",
+        "hit_count": 0
+    }
+}
