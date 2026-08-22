@@ -23,6 +23,7 @@ import threading
 from pathlib import Path
 
 import numpy as np
+import pyaudio
 import speech_recognition as sr
 import pyttsx3
 from faster_whisper import WhisperModel
@@ -265,6 +266,36 @@ def _looks_like_direct_command(transcript: str) -> bool:
     return bool(words and words[0] in COMMAND_START_WORDS)
 
 
+def _current_default_input_index():
+    """Ask the OS (via PyAudio) which input device is *currently* the
+    Windows default. This is a live lookup, unlike sr.Microphone(device_index=
+    None), which only resolves "the default" once, at the moment the stream
+    is opened — so it goes stale if you plug in a headset or unplug earbuds
+    mid-session. Best-effort: returns None if PyAudio can't answer, and the
+    caller treats that as "no change detected"."""
+    try:
+        pa = pyaudio.PyAudio()
+        try:
+            return pa.get_default_input_device_info()["index"]
+        finally:
+            pa.terminate()
+    except Exception:
+        return None
+
+
+def _open_mic():
+    """Open a fresh Microphone bound to whatever is currently the Windows
+    default input device. Always re-resolves the default at call time
+    rather than trusting a cached index, so this is safe to call again
+    after a device change (new Bluetooth earbuds connecting, a USB mic
+    unplugging, etc.) without restarting the app.
+
+    If MIC_DEVICE_INDEX has been explicitly overridden (via --mic), that
+    pinned device is used instead and default-following is skipped — an
+    explicit choice always wins."""
+    return sr.Microphone(device_index=MIC_DEVICE_INDEX)
+
+
 def print_input_devices():
     """List every audio input device speech_recognition can see, with its
     index — so you can find the right value for --mic if the Windows default
@@ -333,31 +364,6 @@ def voice_loop(on_command):
     """
     recognizer = sr.Recognizer()
     recognizer.pause_threshold = 0.8  # shorter pause = snappier phrase-end detection
-    mic = sr.Microphone(device_index=MIC_DEVICE_INDEX)
-
-    print("Calibrating microphone for ambient noise...")
-    with mic as source:
-        recognizer.adjust_for_ambient_noise(source, duration=1)
-
-    # Pin the threshold after calibration. speech_recognition defaults
-    # dynamic_energy_threshold to True, which quietly walks the threshold up
-    # and down while listening and overrides whatever we set here — on a noisy
-    # far-field mic that means it keeps re-triggering on room noise. Turning it
-    # off makes the clamp below actually hold.
-    recognizer.dynamic_energy_threshold = False
-
-    # Clamp into a sane band: floor 300 (sr's own default, comfortably above a
-    # typical ~150-250 ambient noise floor, so noise doesn't count as speech),
-    # ceiling 800 (above that, normal speech starts getting ignored). Tunable.
-    recognizer.energy_threshold = min(max(recognizer.energy_threshold, 300), 800)
-    print(f"(energy_threshold: {recognizer.energy_threshold:.0f}, dynamic: off)")
-
-    # Confirm the device is actually capturing before we sit in the listen loop,
-    # so a dead/wrong mic is obvious in 3s instead of an unexplained silence.
-    mic_check(recognizer, mic)
-
-    _write_state("idle")
-    print(f"Listening for wake word '{WAKE_WORD}'... (Ctrl+C to stop)\n")
 
     # Braille spinner so the terminal visibly "breathes" while idle-listening —
     # otherwise a working-but-quiet mic looks identical to a frozen program.
@@ -368,79 +374,173 @@ def voice_loop(on_command):
         # rather than scrolling. Trailing spaces clear any longer previous line.
         print(f"\r  {next(spinner)} listening for '{WAKE_WORD}'…    ", end="", flush=True)
 
-    # Open the mic ONCE and keep it open for the whole session. Every listen()
-    # below reuses this same stream — no per-phrase re-open, so we never miss the
-    # start of an utterance, and short timeouts let us animate the heartbeat.
-    with mic as source:
-        while True:
-            _write_state("idle")
+    # Re-check what Windows currently reports as the default input device
+    # every DEFAULT_RECHECK_TICKS heartbeat ticks (~30s at the 1.5s wake
+    # timeout below). If it's changed — a headset connected, earbuds dropped,
+    # a USB mic unplugged — we tear down the stream and reopen against the
+    # new default automatically. This only applies when MIC_DEVICE_INDEX is
+    # None (the default-following mode); an explicit --mic override is never
+    # second-guessed.
+    DEFAULT_RECHECK_TICKS = 20
 
-            # Short timeout so that during silence we regain control every few
-            # seconds to tick the heartbeat; returns None on a pure-silence timeout.
-            transcript = _listen_on_source(
-                recognizer, source, phrase_time_limit=5, timeout=WAKE_LISTEN_TIMEOUT
-            )
+    # Outer loop: (re)acquires the mic and runs the listen loop on it. A
+    # dropped/changed device breaks out of the inner loop (via a detected
+    # default change or a stream error) and control comes back here to
+    # reopen — the session as a whole keeps running instead of crashing or
+    # going permanently deaf.
+    first_session = True
+    while True:
+        mic = _open_mic()
+        bound_default_index = _current_default_input_index() if MIC_DEVICE_INDEX is None else None
 
-            if not transcript:
-                # None (silence) or "" (caught noise, nothing intelligible) —
-                # either way we're alive and still waiting. Keep the heartbeat going.
-                _heartbeat()
-                continue
+        print("Calibrating microphone for ambient noise...")
+        with mic as source:
+            recognizer.adjust_for_ambient_noise(source, duration=1)
 
-            transcript_lower = transcript.lower().strip()
-            if not transcript_lower:
-                _heartbeat()
-                continue
+        # Pin the threshold after calibration. speech_recognition defaults
+        # dynamic_energy_threshold to True, which quietly walks the threshold
+        # up and down while listening and overrides whatever we set here — on
+        # a noisy far-field mic that means it keeps re-triggering on room
+        # noise. Turning it off makes the clamp below actually hold.
+        recognizer.dynamic_energy_threshold = False
 
-            # Got real words — finish the heartbeat line (leading \r + padding
-            # overwrites the spinner) and drop to normal scrolling output.
-            print(f"\r(heard: '{transcript_lower}')                    ")
-            log_utterance(transcript_lower, kind="heard")
+        # Clamp into a sane band: floor 300 (sr's own default, comfortably
+        # above a typical ~150-250 ambient noise floor, so noise doesn't count
+        # as speech), ceiling 800 (above that, normal speech starts getting
+        # ignored). Tunable.
+        recognizer.energy_threshold = min(max(recognizer.energy_threshold, 300), 800)
+        print(f"(energy_threshold: {recognizer.energy_threshold:.0f}, dynamic: off)")
 
-            # Use the fuzzy alias matcher instead of a naive substring check.
-            # This catches Whisper mishearings like "asian", "ancient", etc.
-            matched_wake = _find_wake_word(transcript_lower)
+        if first_session:
+            # Only do the up-front capture-check once — on a reconnect after
+            # a device swap we already know audio is flowing, and repeating
+            # this would just add a silent 3s pause every time someone's
+            # Bluetooth earbuds reconnect.
+            mic_check(recognizer, mic)
+            first_session = False
+        else:
+            print("(microphone changed — reconnected to the new default input device)")
 
-            if matched_wake is None:
-                # Also let through obvious commands even without a wake word.
-                if _looks_like_direct_command(transcript_lower):
-                    matched_wake = ""  # treat entire transcript as command
+        _write_state("idle")
+        print(f"Listening for wake word '{WAKE_WORD}'... (Ctrl+C to stop)\n")
+
+        need_reopen = False
+        ticks_since_check = 0
+
+        # Open the mic ONCE per (re)connection and keep it open while nothing
+        # changes. Every listen() below reuses this same stream — no
+        # per-phrase re-open, so we never miss the start of an utterance, and
+        # short timeouts let us animate the heartbeat and check for device
+        # changes regularly.
+        with mic as source:
+            while True:
+                _write_state("idle")
+
+                try:
+                    # Short timeout so that during silence we regain control
+                    # every few seconds to tick the heartbeat and check for a
+                    # device change; returns None on a pure-silence timeout.
+                    transcript = _listen_on_source(
+                        recognizer, source, phrase_time_limit=5, timeout=WAKE_LISTEN_TIMEOUT
+                    )
+                except OSError as e:
+                    # The stream itself died — e.g. the device was unplugged
+                    # mid-listen. Drop out and reopen against whatever is the
+                    # default now, instead of crashing the whole agent.
+                    print(f"\n(microphone stream error: {e} — reconnecting…)")
+                    need_reopen = True
+                    break
+
+                if not transcript:
+                    # None (silence) or "" (caught noise, nothing intelligible)
+                    # — either way we're alive and still waiting. Keep the
+                    # heartbeat going, and periodically confirm we're still on
+                    # the current Windows default device.
+                    _heartbeat()
+                    ticks_since_check += 1
+                    if (
+                        MIC_DEVICE_INDEX is None
+                        and ticks_since_check >= DEFAULT_RECHECK_TICKS
+                    ):
+                        ticks_since_check = 0
+                        current_default = _current_default_input_index()
+                        if (
+                            current_default is not None
+                            and bound_default_index is not None
+                            and current_default != bound_default_index
+                        ):
+                            print(
+                                f"\n(default input device changed — reconnecting…)"
+                            )
+                            need_reopen = True
+                            break
+                    continue
+
+                transcript_lower = transcript.lower().strip()
+                if not transcript_lower:
+                    _heartbeat()
+                    continue
+
+                # Got real words — finish the heartbeat line (leading \r + padding
+                # overwrites the spinner) and drop to normal scrolling output.
+                print(f"\r(heard: '{transcript_lower}')                    ")
+                log_utterance(transcript_lower, kind="heard")
+
+                # Use the fuzzy alias matcher instead of a naive substring check.
+                # This catches Whisper mishearings like "asian", "ancient", etc.
+                matched_wake = _find_wake_word(transcript_lower)
+
+                if matched_wake is None:
+                    # Also let through obvious commands even without a wake word.
+                    if _looks_like_direct_command(transcript_lower):
+                        matched_wake = ""  # treat entire transcript as command
+                    else:
+                        continue  # not addressed to us — stay idle, keep listening
+
+                _write_state("listening")
+
+                # "agent open brave" — command already in the same utterance.
+                if matched_wake and matched_wake in transcript_lower:
+                    after_wake = transcript_lower.split(matched_wake, 1)[1].strip()
                 else:
-                    continue  # not addressed to us — stay idle, keep listening
+                    # Direct command (no wake word) — entire transcript is the command.
+                    after_wake = transcript_lower
 
-            _write_state("listening")
+                if after_wake:
+                    command_text = after_wake
+                else:
+                    # Just "agent" was said alone — do a dedicated follow-up listen
+                    # on the same open source. Wait a bit longer here since the user
+                    # is expected to be about to speak.
+                    print("  (yes? — listening for your command…)")
+                    try:
+                        command_text = _listen_on_source(
+                            recognizer, source, phrase_time_limit=6, timeout=6
+                        )
+                    except OSError as e:
+                        print(f"\n(microphone stream error: {e} — reconnecting…)")
+                        need_reopen = True
+                        break
 
-            # "agent open brave" — command already in the same utterance.
-            if matched_wake and matched_wake in transcript_lower:
-                after_wake = transcript_lower.split(matched_wake, 1)[1].strip()
-            else:
-                # Direct command (no wake word) — entire transcript is the command.
-                after_wake = transcript_lower
+                if not command_text:
+                    continue
 
-            if after_wake:
-                command_text = after_wake
-            else:
-                # Just "agent" was said alone — do a dedicated follow-up listen
-                # on the same open source. Wait a bit longer here since the user
-                # is expected to be about to speak.
-                print("  (yes? — listening for your command…)")
-                command_text = _listen_on_source(
-                    recognizer, source, phrase_time_limit=6, timeout=6
-                )
+                print(f"You (voice): {command_text}")
+                log_utterance(command_text, kind="command")
 
-            if not command_text:
-                continue
+                _write_state("thinking")
+                reply = on_command(command_text)
 
-            print(f"You (voice): {command_text}")
-            log_utterance(command_text, kind="command")
+                if reply:
+                    speak(reply)
 
-            _write_state("thinking")
-            reply = on_command(command_text)
+                # Discard whatever piled up on the stream while we were thinking /
+                # speaking, so we don't immediately "hear" our own reply or stale
+                # noise on the next pass.
+                _drain(source)
 
-            if reply:
-                speak(reply)
-
-            # Discard whatever piled up on the stream while we were thinking /
-            # speaking, so we don't immediately "hear" our own reply or stale
-            # noise on the next pass.
-            _drain(source)
+        if not need_reopen:
+            # Inner loop only exits via one of the `break`s above, both of
+            # which set need_reopen — but if that ever changes, don't spin
+            # silently forever on an unexpected clean exit.
+            break
