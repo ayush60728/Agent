@@ -11,10 +11,14 @@ Currently supports:
                    opens it in File Explorer.
     focus_app   -> explicitly switch the agent's "current" focused app
                    (e.g. "move your focus to brave") without relaunching it.
+    close_app   -> close a named app's window ("close brave"), or the
+                   currently-focused app when the user says "close it".
     click_text  -> finds text on screen (via OCR, scoped to the current
                    focused app's window) and clicks it.
     type_text   -> types a string via keyboard simulation.
     press_key   -> presses a single key or key combo (e.g. "enter", "ctrl+s").
+    scroll      -> scrolls the focused window up or down.
+    screenshot  -> captures the screen to a PNG in the user's Pictures folder.
     wait        -> pauses for N seconds between steps.
 
 click_text/type_text/press_key all check that the currently-focused app is
@@ -35,7 +39,9 @@ from desktop_actions import type_text as _type_text
 from desktop_actions import press_key as _press_key
 from desktop_actions import wait as _wait
 from desktop_actions import focus_app as _focus_app
-from desktop_actions import check_focus_app_running
+from desktop_actions import close_app as _close_app
+from desktop_actions import scroll as _scroll
+from desktop_actions import take_screenshot as _take_screenshot
 from desktop_actions import get_current_focus_app
 
 
@@ -123,6 +129,19 @@ def focus_app(app_name: str) -> str:
     return _focus_app(app_name)
 
 
+def close_app(target: str = "") -> str:
+    """Close a window — either a named app ("close brave") or the currently
+    focused app when the user just says "close it" / "close this window"
+    (empty/pronoun target).
+
+    Unlike click/type/key, this does NOT require re-activating the app
+    first — it posts a close straight to the window handle — so it works
+    even when this terminal has the foreground. That's also why it doesn't
+    call _ensure_focused_app_active()."""
+
+    return _close_app(target or "")
+
+
 def _ensure_focused_app_active() -> str | None:
     """Re-activate the tracked focused app right before a click/type/key
     action. This matters because typing the *next* command into this
@@ -197,6 +216,29 @@ def wait(seconds) -> str:
         return f"'{seconds}' isn't a valid wait duration."
 
 
+def scroll(direction: str) -> str:
+    """Scroll the focused window up or down. Unlike click/type/key this
+    doesn't hard-fail when no app is tracked — scrolling whatever's in the
+    foreground is harmless — but if we ARE tracking a focused app, bring it
+    forward first so the wheel lands on it and not this terminal."""
+
+    if not direction:
+        return "I need a direction to scroll (up or down)."
+
+    current = get_current_focus_app()
+    if current:
+        _focus_app(current)  # best-effort; _scroll targets the active window
+
+    return _scroll(direction)
+
+
+def take_screenshot(name: str = "") -> str:
+    """Capture the screen to a PNG in the user's Pictures folder. Needs no
+    focused app — it grabs the whole screen."""
+
+    return _take_screenshot(name)
+
+
 def execute_action(action: dict) -> str:
     """
     Dispatch a structured action to the right handler.
@@ -222,6 +264,9 @@ def execute_action(action: dict) -> str:
     if action_type == "focus_app":
         return focus_app(action.get("target", ""))
 
+    if action_type == "close_app":
+        return close_app(action.get("target", ""))
+
     if action_type == "click_text":
         return click_text(action.get("target", ""))
 
@@ -233,6 +278,12 @@ def execute_action(action: dict) -> str:
 
     if action_type == "wait":
         return wait(action.get("target"))
+
+    if action_type == "scroll":
+        return scroll(action.get("target", ""))
+
+    if action_type == "screenshot":
+        return take_screenshot(action.get("target", ""))
 
     return f"Unknown action: {action_type}"
 
@@ -269,6 +320,10 @@ if __name__ == "__main__":
             result = execute_action({"action": "press_key", "target": user_input[4:].strip()})
         elif user_input.lower().startswith("wait "):
             result = execute_action({"action": "wait", "target": user_input[5:].strip()})
+        elif user_input.lower().startswith("scroll "):
+            result = execute_action({"action": "scroll", "target": user_input[7:].strip()})
+        elif user_input.lower() in ("screenshot", "screen"):
+            result = execute_action({"action": "screenshot", "target": ""})
         else:
             # No prefix given -> assume it's an app, same as before.
             result = execute_action({"action": "open_app", "target": user_input})

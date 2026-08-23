@@ -5,6 +5,7 @@ import sys
 import ollama
 
 from actions import execute_action
+from builtin_commands import get_builtin_action
 from prompt_cache import get_cached_action, save_action, forget_prompt
 
 
@@ -59,6 +60,9 @@ spotify", "go back to vs code"). This does NOT launch the app — only
 open_app does that. Use focus_app when the app is presumably already
 running and the user just wants attention/clicks/typing directed at it.
 
+Do NOT use focus_app to CLOSE, quit, or exit an app — that is close_app
+(action 8). "close brave" means close it, not focus it.
+
 Format:
 {
     "action": "focus_app",
@@ -105,6 +109,58 @@ Format:
     "action": "wait",
     "target": <number of seconds>
 }
+
+8. close_app
+Use this when the user wants to close, quit, exit, or shut down an app or
+window (e.g. "close brave", "close it", "close this window", "quit
+spotify", "shut spotify down").
+
+If the user names an app, use it as the target. If they just say "it",
+"this", "that", or "this window" — meaning whatever the agent is currently
+focused on — set the target to an empty string "".
+
+Format:
+{
+    "action": "close_app",
+    "target": "application name (or \"\" for the current window)"
+}
+
+CRITICAL RULE: closing a browser TAB is NOT close_app. "close the tab",
+"close this tab", "close tab" is press_key with target "ctrl+w". Use
+close_app only to close a whole window or application.
+
+CRITICAL RULE: clicking an "X", "cross mark", "close button", or "close
+icon" is a CLOSE intent — the X is a picture the agent cannot read as
+text, so never use click_text for it. Use close_app to close a window, or
+press_key "ctrl+w" to close a tab.
+
+9. scroll
+Use this when the user wants to scroll the current window up or down
+(e.g. "scroll down", "scroll up", "go down a bit").
+
+Format:
+{
+    "action": "scroll",
+    "target": "up" or "down"
+}
+
+10. screenshot
+Use this when the user wants to take/capture a screenshot of the screen.
+
+Format:
+{
+    "action": "screenshot",
+    "target": ""
+}
+
+MEDIA & VOLUME: media playback and system volume are done with press_key
+using the special media keys. Map them like this:
+- play / pause / resume        -> press_key "playpause"
+- next song / skip / next track-> press_key "nexttrack"
+- previous song / last track   -> press_key "prevtrack"
+- volume up / louder           -> press_key "volumeup"
+- volume down / quieter        -> press_key "volumedown"
+- mute / unmute                -> press_key "volumemute"
 
 Rules:
 - Return ONLY valid JSON.
@@ -190,9 +246,65 @@ User: focus the address bar
 Output:
 {"action":"press_key","target":"ctrl+l"}
 
+User: scroll down
+Output:
+{"action":"scroll","target":"down"}
+
+User: scroll up a bit
+Output:
+{"action":"scroll","target":"up"}
+
+User: take a screenshot
+Output:
+{"action":"screenshot","target":""}
+
+User: play the song
+Output:
+{"action":"press_key","target":"playpause"}
+
+User: turn the volume up
+Output:
+{"action":"press_key","target":"volumeup"}
+
+User: mute it
+Output:
+{"action":"press_key","target":"volumemute"}
+
+User: skip this song
+Output:
+{"action":"press_key","target":"nexttrack"}
+
 User: wait 2 seconds
 Output:
 {"action":"wait","target":2}
+
+User: close brave
+Output:
+{"action":"close_app","target":"brave"}
+
+User: quit spotify
+Output:
+{"action":"close_app","target":"spotify"}
+
+User: close it
+Output:
+{"action":"close_app","target":""}
+
+User: close this window
+Output:
+{"action":"close_app","target":""}
+
+User: close the tab
+Output:
+{"action":"press_key","target":"ctrl+w"}
+
+User: close this tab
+Output:
+{"action":"press_key","target":"ctrl+w"}
+
+User: click the X to close it
+Output:
+{"action":"close_app","target":""}
 """
 
 
@@ -200,9 +312,12 @@ ALLOWED_ACTIONS = {
     "open_app",
     "open_folder",
     "focus_app",
+    "close_app",
     "click_text",
     "type_text",
     "press_key",
+    "scroll",
+    "screenshot",
     "wait",
 }
 
@@ -225,6 +340,10 @@ def ask_qwen(user_input):
                         # a valid JSON object. This is what actually stops
                         # the "let's see, the user said..." reasoning text,
                         # regardless of whether think=False is honored.
+        keep_alive="30m",  # Keep the model resident between commands so we
+                           # don't pay the cold model-load latency (several
+                           # seconds) on every request. Ollama otherwise
+                           # unloads an idle model after ~5 minutes.
         options={
             "temperature": 0,   # deterministic — we want consistent JSON, not creativity
             "num_predict": 80,  # small headroom above the old 60; format=json adds a little overhead
@@ -271,11 +390,27 @@ def validate_action(action):
     if action_type not in ALLOWED_ACTIONS:
         return False, f"Action '{action_type}' is not allowed."
 
-    if action_type in ("open_app", "open_folder", "focus_app", "click_text", "type_text", "press_key"):
+    if action_type in ("open_app", "open_folder", "focus_app", "click_text", "type_text", "press_key", "scroll"):
         target = action.get("target")
 
         if not isinstance(target, str) or not target.strip():
             return False, "Target is missing."
+
+    if action_type == "screenshot":
+        # Target is optional (an output filename). If present, it must be text.
+        target = action.get("target")
+
+        if target is not None and not isinstance(target, str):
+            return False, "Screenshot target must be text."
+
+    if action_type == "close_app":
+        # Target is optional here: an empty target (or a pronoun like "it")
+        # means "close the currently-focused app". If a target is given
+        # though, it must be text.
+        target = action.get("target")
+
+        if target is not None and not isinstance(target, str):
+            return False, "Close target must be text."
 
     if action_type == "wait":
         target = action.get("target")
@@ -301,6 +436,11 @@ def validate_action(action):
 
 EXIT_WORDS = {"exit", "quit", "stop", "bye"}
 
+# In VOICE mode "stop" must NOT be treated as an exit word — you can't exit
+# voice mode by voice anyway (it just says so), and "stop"/"stop music" should
+# reach the media builtin. Text mode keeps "stop" as a convenient typed exit.
+VOICE_EXIT_WORDS = {"exit", "quit", "bye", "goodbye"}
+
 
 def process_command(user_input: str, write_pet_state=None) -> str:
     """
@@ -320,12 +460,21 @@ def process_command(user_input: str, write_pet_state=None) -> str:
     try:
         _pet("thinking")
 
-        # 1. Check the prompt cache first — skip Qwen entirely if
-        #    we've seen this exact phrasing before.
-        action = get_cached_action(user_input)
-        was_cached = action is not None
+        # 1. Curated builtins first — instant and deterministic (no LLM, no
+        #    cache-file read). Covers the hottest commands: scroll, volume,
+        #    media, copy/paste, new tab, and so on.
+        action = get_builtin_action(user_input)
+        from_builtin = action is not None
 
-        if was_cached:
+        # 2. Then the learned prompt cache — skip Qwen if we've classified
+        #    this exact phrasing before.
+        if not from_builtin:
+            action = get_cached_action(user_input)
+        was_cached = (not from_builtin) and action is not None
+
+        if from_builtin:
+            print("⚡ Built-in command (no LLM call)")
+        elif was_cached:
             print("⚡ Using cached response (no LLM call)")
         else:
             raw_response = ask_qwen(user_input)
@@ -351,10 +500,11 @@ def process_command(user_input: str, write_pet_state=None) -> str:
             _pet("idle")
             return f"Action rejected: {error}"
 
-        # 2. Only cache freshly-classified, validated actions — never
-        #    re-save a cache hit (already updated its own hit_count),
-        #    and never cache something that failed validation.
-        if not was_cached:
+        # 3. Only cache a freshly LLM-classified, validated action — never
+        #    re-save a cache hit (it bumped its own hit_count already), and
+        #    never persist a builtin (the builtin table already catches it,
+        #    faster than the cache would).
+        if not from_builtin and not was_cached:
             save_action(user_input, action)
 
         print("⚙️ Executing:", action)
@@ -420,7 +570,7 @@ def run_voice_mode():
         voice_io._write_state(state)
 
     def on_command(command_text: str) -> str:
-        if command_text.lower().strip() in EXIT_WORDS:
+        if command_text.lower().strip() in VOICE_EXIT_WORDS:
             # Voice mode doesn't have a clean way to break its own loop
             # from in here; just let it keep listening but say goodbye.
             return "Okay, but I'm still listening — close this window to fully stop."

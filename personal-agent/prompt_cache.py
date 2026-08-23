@@ -20,10 +20,18 @@ CACHE_FILE = Path(__file__).parent / "prompt_cache.json"
 
 
 def normalize_prompt(text: str) -> str:
-    """Light normalization only — lowercase, trim, collapse whitespace.
-    No fuzzy matching, no filler-word stripping: we want this cache to
-    only hit on genuinely repeated phrasing, not guess at intent."""
-    return re.sub(r"\s+", " ", text.strip().lower())
+    """Light normalization only — lowercase, trim, collapse whitespace, and
+    strip surrounding punctuation. No fuzzy matching, no filler-word
+    stripping: we want this cache to only hit on genuinely repeated phrasing,
+    not guess at intent.
+
+    Stripping surrounding punctuation matters because voice transcripts arrive
+    with trailing "." / "?" ("open brave." vs the typed "open brave"), which
+    would otherwise split the cache into duplicate entries and drop the hit
+    rate. Only the ends are trimmed — internal punctuation like the "." in
+    "type youtube.com" is preserved."""
+    text = re.sub(r"\s+", " ", text.strip().lower())
+    return text.strip(" .,!?;:\"'()[]")
 
 
 def _load_cache() -> dict:

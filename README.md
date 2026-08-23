@@ -70,9 +70,9 @@ All source code is in [`personal-agent`](personal-agent/).
 | [`test_resolver.py`](personal-agent/test_resolver.py) | Interactive application resolver test. |
 | [`record_test.py`](personal-agent/record_test.py) | Records a short WAV file to verify microphone capture. |
 | [`list_mics.py`](personal-agent/list_mics.py) | Lists microphone device names and indices. |
-| [`CODEBASE_WALKTHROUGH.md`](personal-agent/CODEBASE_WALKTHROUGH.md) | Earlier internal walkthrough; this README documents the current implementation. |
+| [`CODEBASE_WALKTHROUGH.md`](personal-agent/CODEBASE_WALKTHROUGH.md) | Detailed walkthrough of the current runtime pipeline and module responsibilities. |
 
-`brain.py` and `config.py` are currently empty placeholders. `requirements.txt` is also empty, so install the dependencies listed below manually or add pinned versions before distributing the project.
+`brain.py` and `config.py` are currently empty placeholders. `requirements.txt` is also empty, so the dependencies below are currently installed manually. Add compatible pinned versions there before distributing the project.
 
 ## Requirements
 
@@ -95,7 +95,7 @@ python -m venv .venv
 .\.venv\Scripts\Activate.ps1
 ```
 
-Install the Python packages imported by the project:
+Install the Python packages imported by the project. They are currently not declared in `requirements.txt`:
 
 ```powershell
 python -m pip install --upgrade pip
@@ -126,7 +126,7 @@ Examples:
 
 ```text
 open brave
-open downloads
+ Run `python agent.py --list-mics`.
 focus spotify
 click search
 type youtube.com
@@ -255,7 +255,7 @@ These files can contain machine-specific paths and personal activity. Review the
 - Voice mode is continuous. `exit` spoken as a command produces a response but does not terminate the voice loop; close the terminal or press `Ctrl+C` to stop it.
 - The Tesseract executable path is currently hard-coded for the default Windows installation location.
 - There is no authentication, remote control API, confirmation dialog, undo system, or multi-user isolation.
-- `requirements.txt` does not yet pin or declare dependencies.
+- `requirements.txt` does not yet declare or pin dependencies.
 
 ## Troubleshooting
 

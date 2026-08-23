@@ -1,11 +1,11 @@
 # Personal Agent Codebase Walkthrough
 
-This repository is a local-first Windows personal agent prototype. The current working version is a typed-command agent that uses a local Ollama/Qwen model to convert user text into structured JSON actions, then executes safe local actions such as opening apps and folders.
+This repository is a local-first Windows personal agent prototype. The current working version accepts typed commands or voice commands, uses a local Ollama/Qwen model to convert user text into one structured JSON action, and executes it through trusted Python code.
 
-The project is not a floating desktop assistant yet, and it does not listen to voice yet. The current milestone is:
+The current milestone is:
 
 ```text
-typed command -> local LLM -> JSON action -> Windows executor -> confirmation
+typed/spoken command -> local LLM -> validated JSON action -> Windows executor -> confirmation
 ```
 
 ## Current File Map
@@ -13,7 +13,7 @@ typed command -> local LLM -> JSON action -> Windows executor -> confirmation
 ```text
 personal-agent/
   agent.py              Main CLI agent loop, Ollama call, JSON cleanup, validation.
-  actions.py            Executes structured actions: open_app and open_folder.
+  actions.py            Dispatches and executes the allowlisted desktop actions.
   app_resolver.py       Finds installed Windows applications and caches paths.
   folder_resolver.py    Finds known/custom folders and caches custom folder paths.
   prompt_cache.py       Caches prompt text -> validated action mappings.
@@ -22,10 +22,14 @@ personal-agent/
   prompt_cache.json     Local cache of repeated user prompts.
   Modelfile             Ollama model recipe for qwen3-nothink.
   test_resolver.py      Interactive CLI test for app lookup only.
+  desktop_actions.py   Focuses windows, performs OCR, clicks, types, and presses keys.
+  voice_io.py          Wake-word listening, Faster Whisper, TTS, state, and voice logs.
+  pet_ui.py             Optional Tkinter desktop pet driven by agent_state.json.
+  record_test.py        Records a WAV file to diagnose microphone capture.
+  list_mics.py          Lists available microphone devices.
   brain.py              Empty placeholder; LLM logic currently lives in agent.py.
   config.py             Empty placeholder for future settings.
-  voice.py              Empty placeholder for future speech input/output.
-  requirements.txt      Empty placeholder for Python dependencies.
+  requirements.txt      Currently empty; dependencies are installed manually.
 ```
 
 Generated files/folders such as `__pycache__/` and `.venv/` are not source design.
@@ -76,6 +80,10 @@ Main responsibilities:
 - Parse and validate the JSON action.
 - Save newly validated actions to the prompt cache.
 - Execute the action through `actions.execute_action`.
+
+`main()` also supports `--voice`, `--mic INDEX`, and `--list-mics`. Voice mode
+uses the same `process_command()` pipeline as typed mode, so validation,
+caching, and execution are shared.
 
 Current model:
 
@@ -141,16 +149,25 @@ Supported actions:
 {"action":"open_folder","target":"downloads"}
 ```
 
-`validate_action()` only allows:
+`validate_action()` currently allows:
 
 ```python
 ALLOWED_ACTIONS = {
     "open_app",
     "open_folder",
+  "focus_app",
+  "close_app",
+  "click_text",
+  "type_text",
+  "press_key",
+  "wait",
 }
 ```
 
-Each allowed action must include a non-empty string `target`.
+Each desktop action must include a non-empty string `target`, **except**
+`close_app`, whose `target` is optional — an empty target (or a pronoun like
+"it"/"this window") means "close the currently-focused app". `wait` accepts a
+non-negative number of seconds, including a numeric string.
 
 ## `Modelfile`
 
@@ -213,6 +230,12 @@ Public functions:
 ```python
 open_app(app_name: str) -> str
 open_folder(folder_name: str) -> str
+focus_app(app_name: str) -> str
+close_app(target: str = "") -> str
+click_text(target_text: str) -> str
+type_text(text: str) -> str
+press_key(key: str) -> str
+wait(seconds) -> str
 execute_action(action: dict) -> str
 ```
 
@@ -221,6 +244,12 @@ execute_action(action: dict) -> str
 ```text
 open_app    -> open_app(target)
 open_folder -> open_folder(target)
+focus_app   -> focus_app(target)
+close_app   -> close_app(target)   # target optional; "" => current window
+click_text  -> click_text(target)
+type_text   -> type_text(target)
+press_key   -> press_key(target)
+wait        -> wait(target)
 ```
 
 Both `open_app()` and `open_folder()` use the same self-healing pattern:
@@ -447,9 +476,25 @@ quit / exit         Stop the test program.
 
 It does not test folders or the full agent loop.
 
+## Voice Input and Desktop Pet
+
+`voice_io.py` keeps one microphone stream open while it listens for the wake
+word `agent`. It calibrates ambient noise, transcribes WAV bytes with Faster
+Whisper (`base.en`, CPU/int8), filters likely non-speech and filler
+hallucinations, accepts common wake-word aliases, and passes commands into
+`agent.process_command()`. It uses pyttsx3 for replies and drains buffered
+audio after each command so the agent does not immediately hear its own TTS.
+
+The default microphone follows the current Windows default input device.
+`--mic INDEX` pins one device. The loop detects default-device changes and
+reconnects automatically. `agent_state.json` carries `idle`, `listening`,
+`thinking`, and `speaking` states. `pet_ui.py` polls this file and animates an
+optional always-on-top Tkinter overlay. `voice_log.json` records heard phrases,
+commands, and spoken responses.
+
 ## Cache Files
 
-The three JSON cache files are local machine state, not portable app configuration.
+The JSON files are local machine state, not portable app configuration.
 
 ### `app_paths.json`
 
@@ -491,6 +536,13 @@ Stores prompt classifications:
   }
 }
 ```
+
+### `agent_state.json` and `voice_log.json`
+
+`agent_state.json` is the small state channel used by voice mode and the pet.
+`voice_log.json` is an append-only activity log for recognized speech and TTS
+responses. These files may contain personal activity and should be reviewed
+before sharing.
 
 ## Current MVP Sequence
 
@@ -536,32 +588,33 @@ The current project can:
 - Cache app and custom folder paths.
 - Rescan stale app/folder paths once if launch fails.
 - Forget bad prompt and resolver cache entries through helper functions.
+- Focus running applications and protect click/type/key actions from acting in
+  an untracked foreground window.
+- Capture voice commands, speak responses, and expose state to the desktop pet.
+- Use OCR to find visible text and simulate clicks, typing, and key presses.
 
-## What Is Not Built Yet
+## Not Yet Built
 
 The current project does not yet include:
 
-- Voice recognition.
-- Wake word detection.
-- Text-to-speech.
-- Floating desktop UI.
-- Screen capture, OCR, or vision understanding.
 - Long-term memory database.
 - Skill/workflow recording.
 - Sandbox mode.
-- Permission levels beyond basic action validation.
-- Audit logs.
+- Permission levels beyond action validation.
+- Confirmation dialogs, undo, authentication, remote control, or
+  multi-user isolation.
 
 ## Known Cleanup Notes
 
 - `brain.py` is empty even though the LLM logic currently lives in `agent.py`. Later, moving model/classification code into `brain.py` would make the structure cleaner.
-- `requirements.txt` is empty even though the project uses `ollama`.
+- `requirements.txt` is empty even though the project uses multiple runtime
+  dependencies; the parent README documents the current manual install.
 - Some console strings contain mojibake characters from encoding issues. They do not block execution, but they make terminal output look corrupted.
 - The local `.venv` appears broken on this machine. Syntax verification was done with Codex's bundled Python instead.
 
 ## Recommended Next Build Step
 
-The next clean step is to split responsibilities without adding new features:
+The next clean step is to split responsibilities without changing behavior:
 
 ```text
 agent.py -> input loop and orchestration
@@ -569,8 +622,7 @@ brain.py -> ask_qwen, JSON cleanup, validate_action
 actions.py -> trusted execution
 ```
 
-After that, add `requirements.txt`, then build the first voice path:
-
-```text
-microphone -> local speech-to-text -> existing agent action flow
-```
+After that, declare and pin the runtime dependencies in `requirements.txt`,
+then add focused automated tests around validation, cache behavior, resolver
+matching, and voice parsing. Hardware-dependent OCR, microphone, and window
+focus behavior should remain covered by the existing manual diagnostics.

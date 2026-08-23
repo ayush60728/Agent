@@ -22,6 +22,11 @@ import time
 import threading
 from pathlib import Path
 
+try:
+    import winsound  # Windows stdlib — short chirp to acknowledge the wake word
+except ImportError:  # non-Windows (voice mode is Windows-only, but stay safe)
+    winsound = None
+
 import numpy as np
 import pyaudio
 import speech_recognition as sr
@@ -106,7 +111,44 @@ WAKE_LISTEN_TIMEOUT = 1.5
 _whisper_model = WhisperModel("base.en", device="cpu", compute_type="int8")
 
 _tts_engine = pyttsx3.init()
+
+# pyttsx3 defaults to ~200 wpm, which sounds rushed and clipped. Slowing it a
+# touch makes replies noticeably clearer. Best-effort — never let a TTS
+# property quirk stop the engine from initialising.
+try:
+    _tts_engine.setProperty("rate", 175)
+except Exception:
+    pass
+
 _tts_lock = threading.Lock()  # pyttsx3 isn't safe to call from multiple threads at once
+
+
+# Words that mean "abort, I didn't actually want anything" after the wake
+# word — handled locally so they never hit the LLM. Matched whole, against a
+# punctuation-stripped transcript.
+_CANCEL_WORDS = {
+    "cancel", "never mind", "nevermind", "forget it", "forget that",
+    "nothing", "leave it",
+}
+
+
+def _chirp():
+    """Short 'I'm listening' tone the moment the wake word registers, so you
+    don't have to watch the terminal to know it heard you. Best-effort and
+    non-fatal — voice mode still works with the sound device muted."""
+    if winsound is None:
+        return
+    try:
+        winsound.Beep(1000, 90)
+    except Exception:
+        pass
+
+
+def _is_cancel(text: str) -> bool:
+    """True if the command is just a cancel/never-mind phrase."""
+    normalized = re.sub(r"[^a-z0-9\s]", "", text.lower())
+    normalized = re.sub(r"\s+", " ", normalized).strip()
+    return normalized in _CANCEL_WORDS
 
 
 def _write_state(state: str, extra: dict = None):
@@ -344,6 +386,11 @@ def mic_check(recognizer: sr.Recognizer, mic: sr.Microphone, seconds: float = 3.
         if rms < 800:
             print(f"     Level is low (rms {rms:.0f}) — this looks like background/far-field")
             print("     sound, not close speech. Try: speak directly into the mic, or")
+            idx = _current_default_input_index()
+            names = sr.Microphone.list_microphone_names()
+            if idx is not None and 0 <= idx < len(names):
+                print(f"     (current default input is [{idx}] {names[idx]} —")
+                print("      a room-facing array like this is the usual culprit.)")
             print("     pick the right input device -> python agent.py --list-mics")
             print("     then run: python agent.py --mic <index> --voice")
         else:
@@ -498,6 +545,7 @@ def voice_loop(on_command):
                         continue  # not addressed to us — stay idle, keep listening
 
                 _write_state("listening")
+                _chirp()  # audible "I heard you" the instant the wake word lands
 
                 # "agent open brave" — command already in the same utterance.
                 if matched_wake and matched_wake in transcript_lower:
@@ -523,6 +571,20 @@ def voice_loop(on_command):
                         break
 
                 if not command_text:
+                    # We chirped/acknowledged the wake word but heard no
+                    # command — say so instead of silently looping, so it's
+                    # obvious the agent is waiting rather than ignoring you.
+                    # (Only reachable via the "agent" -> follow-up path.)
+                    speak("I didn't catch that.")
+                    _drain(source)
+                    continue
+
+                if _is_cancel(command_text):
+                    # "never mind" / "cancel" — abort quietly, no LLM call.
+                    print(f"\r(heard: '{command_text}') — cancelled            ")
+                    log_utterance(command_text, kind="command")
+                    _write_state("idle")
+                    _drain(source)
                     continue
 
                 print(f"You (voice): {command_text}")
