@@ -79,6 +79,14 @@ Format:
     "target": "text visible on screen"
 }
 
+If the user mentions a COLOR ("click the red submit button", "the green
+one"), KEEP the color word in the target — the agent uses it to pick the
+right control among look-alikes:
+{
+    "action": "click_text",
+    "target": "red submit"
+}
+
 5. type_text
 Use this when the user wants to type text into whatever currently has
 focus (e.g. a search bar, text field, address bar).
@@ -151,6 +159,19 @@ Format:
 {
     "action": "screenshot",
     "target": ""
+}
+
+11. get_color
+Use this when the user asks what COLOR something is — either the color
+under the mouse cursor, or the color of a named on-screen element.
+
+If they ask about "this", "here", or the cursor, set target to "". If they
+name an element ("what color is the login button"), put its text in target.
+
+Format:
+{
+    "action": "get_color",
+    "target": "" or "element text"
 }
 
 MEDIA & VOLUME: media playback and system volume are done with press_key
@@ -258,6 +279,22 @@ User: take a screenshot
 Output:
 {"action":"screenshot","target":""}
 
+User: what color is this
+Output:
+{"action":"get_color","target":""}
+
+User: what colour is the login button
+Output:
+{"action":"get_color","target":"login"}
+
+User: click the red submit button
+Output:
+{"action":"click_text","target":"red submit"}
+
+User: click the green one
+Output:
+{"action":"click_text","target":"green one"}
+
 User: play the song
 Output:
 {"action":"press_key","target":"playpause"}
@@ -318,6 +355,7 @@ ALLOWED_ACTIONS = {
     "press_key",
     "scroll",
     "screenshot",
+    "get_color",
     "wait",
 }
 
@@ -402,6 +440,14 @@ def validate_action(action):
 
         if target is not None and not isinstance(target, str):
             return False, "Screenshot target must be text."
+
+    if action_type == "get_color":
+        # Target is optional: empty means "the color under the cursor". If a
+        # target is given (an element to read), it must be text.
+        target = action.get("target")
+
+        if target is not None and not isinstance(target, str):
+            return False, "Color target must be text."
 
     if action_type == "close_app":
         # Target is optional here: an empty target (or a pronoun like "it")

@@ -106,6 +106,13 @@ _NOISE_FILLERS = {
 # cheap (it never reaches Whisper), so a low value costs almost nothing.
 WAKE_LISTEN_TIMEOUT = 1.5
 
+# How many back-to-back listen/transcribe failures we tolerate before tearing
+# the mic down and reopening it. A single faster-whisper or audio-driver hiccup
+# must NOT kill the session — we log it, back off briefly, and keep listening.
+# But if every listen is failing (e.g. the device wedged into an error state),
+# we reconnect rather than hot-spin forever on the same exception.
+MAX_CONSECUTIVE_ERRORS = 5
+
 # "base.en" = small, fast on CPU, good enough for short commands.
 # Bump to "small.en" / "medium.en" if you have a GPU and want more accuracy.
 _whisper_model = WhisperModel("base.en", device="cpu", compute_type="int8")
@@ -205,9 +212,15 @@ def speak(text: str):
     captures both sides of the conversation, not just what the user said."""
     _write_state("speaking", {"text": text})
     log_utterance(text, kind="response")
-    with _tts_lock:
-        _tts_engine.say(text)
-        _tts_engine.runAndWait()
+    try:
+        with _tts_lock:
+            _tts_engine.say(text)
+            _tts_engine.runAndWait()
+    except Exception as e:
+        # A TTS engine hiccup (SAPI glitch, engine left in a bad run-loop
+        # state) must never take down the voice loop — the command already
+        # ran; the spoken reply is the only thing lost.
+        print(f"(TTS error: {type(e).__name__}: {e})")
     _write_state("idle")
 
 
@@ -473,6 +486,7 @@ def voice_loop(on_command):
 
         need_reopen = False
         ticks_since_check = 0
+        consecutive_errors = 0
 
         # Open the mic ONCE per (re)connection and keep it open while nothing
         # changes. Every listen() below reuses this same stream — no
@@ -497,6 +511,28 @@ def voice_loop(on_command):
                     print(f"\n(microphone stream error: {e} — reconnecting…)")
                     need_reopen = True
                     break
+                except Exception as e:
+                    # Any other failure — most likely a faster-whisper
+                    # transcription error or a transient driver glitch. A
+                    # single bad phrase must not kill the session: log it,
+                    # back off briefly, and keep listening. Only if failures
+                    # pile up do we reopen the mic (instead of hot-spinning on
+                    # the same error). Ctrl+C still exits — KeyboardInterrupt
+                    # is a BaseException, so this except never swallows it.
+                    consecutive_errors += 1
+                    print(
+                        f"\n(voice error #{consecutive_errors}: "
+                        f"{type(e).__name__}: {e})"
+                    )
+                    if consecutive_errors >= MAX_CONSECUTIVE_ERRORS:
+                        print("(too many consecutive voice errors — reconnecting mic…)")
+                        need_reopen = True
+                        break
+                    time.sleep(0.5)
+                    continue
+
+                # A clean listen (speech or silence) resets the failure streak.
+                consecutive_errors = 0
 
                 if not transcript:
                     # None (silence) or "" (caught noise, nothing intelligible)
@@ -569,6 +605,12 @@ def voice_loop(on_command):
                         print(f"\n(microphone stream error: {e} — reconnecting…)")
                         need_reopen = True
                         break
+                    except Exception as e:
+                        # Transcription/driver hiccup while waiting for the
+                        # command — don't crash; just abandon this one turn.
+                        print(f"\n(voice error hearing command: {type(e).__name__}: {e})")
+                        _drain(source)
+                        continue
 
                 if not command_text:
                     # We chirped/acknowledged the wake word but heard no

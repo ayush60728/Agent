@@ -42,6 +42,7 @@ from desktop_actions import focus_app as _focus_app
 from desktop_actions import close_app as _close_app
 from desktop_actions import scroll as _scroll
 from desktop_actions import take_screenshot as _take_screenshot
+from desktop_actions import get_color as _get_color
 from desktop_actions import get_current_focus_app
 
 
@@ -239,6 +240,15 @@ def take_screenshot(name: str = "") -> str:
     return _take_screenshot(name)
 
 
+def get_color(target: str = "") -> str:
+    """Name a color on screen: the pixel under the cursor (empty/"this"
+    target), or the dominant color of a named element ("what color is the
+    submit button"). Passive read — desktop_actions.get_color brings the
+    tracked app forward itself for the element case, so no focus guard here."""
+
+    return _get_color(target or "")
+
+
 def execute_action(action: dict) -> str:
     """
     Dispatch a structured action to the right handler.
@@ -284,6 +294,9 @@ def execute_action(action: dict) -> str:
 
     if action_type == "screenshot":
         return take_screenshot(action.get("target", ""))
+
+    if action_type == "get_color":
+        return get_color(action.get("target", ""))
 
     return f"Unknown action: {action_type}"
 

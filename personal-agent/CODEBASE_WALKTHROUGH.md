@@ -23,6 +23,8 @@ personal-agent/
   Modelfile             Ollama model recipe for qwen3-nothink.
   test_resolver.py      Interactive CLI test for app lookup only.
   desktop_actions.py   Focuses windows, performs OCR, clicks, types, and presses keys.
+  ui_automation.py     Clicks icon-only controls by accessible name via the Windows UIA tree (click_text's fallback when OCR finds no text).
+  color_vision.py      Names on-screen colors (get_color) and disambiguates same-text matches by color for click_text.
   voice_io.py          Wake-word listening, Faster Whisper, TTS, state, and voice logs.
   pet_ui.py             Optional Tkinter desktop pet driven by agent_state.json.
   record_test.py        Records a WAV file to diagnose microphone capture.
@@ -155,19 +157,28 @@ Supported actions:
 ALLOWED_ACTIONS = {
     "open_app",
     "open_folder",
-  "focus_app",
-  "close_app",
-  "click_text",
-  "type_text",
-  "press_key",
-  "wait",
+    "focus_app",
+    "close_app",
+    "click_text",
+    "type_text",
+    "press_key",
+    "scroll",
+    "screenshot",
+    "get_color",
+    "wait",
 }
 ```
 
 Each desktop action must include a non-empty string `target`, **except**
-`close_app`, whose `target` is optional — an empty target (or a pronoun like
-"it"/"this window") means "close the currently-focused app". `wait` accepts a
-non-negative number of seconds, including a numeric string.
+`close_app`, `screenshot`, and `get_color`, whose `target` is optional. An
+empty `close_app` target (or a pronoun like "it"/"this window") means "close
+the currently-focused app"; an empty `get_color` target means "the color under
+the cursor". `wait` accepts a non-negative number of seconds, including a
+numeric string.
+
+`click_text` also accepts a leading color word ("red submit"): the color is
+stripped from the text to locate and used to disambiguate look-alike matches
+(see `color_vision.py`).
 
 ## `Modelfile`
 
@@ -592,6 +603,10 @@ The current project can:
   an untracked foreground window.
 - Capture voice commands, speak responses, and expose state to the desktop pet.
 - Use OCR to find visible text and simulate clicks, typing, and key presses.
+- Fall back to the Windows accessibility (UIA) tree to click icon-only controls
+  (hamburger menu, gear, close X) that have no visible text for OCR to read.
+- Name on-screen colors, and use a spoken color word to pick the right control
+  among same-text look-alikes ("click the red submit button").
 
 ## Not Yet Built
 

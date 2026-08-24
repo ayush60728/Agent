@@ -7,6 +7,8 @@ import pytesseract
 import pygetwindow as gw
 from PIL import Image
 
+import color_vision
+
 pyautogui.PAUSE = 0.1  # small delay after each pyautogui call, avoids race conditions
 
 pytesseract.pytesseract.tesseract_cmd = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
@@ -142,10 +144,14 @@ def close_app(target: str = "") -> str:
     return f"closed {app_label}"
 
 
-def find_text_on_screen(target_text: str):
-    """Screenshot the active window (not the whole screen), OCR it,
-    return (x, y) absolute screen coordinates of the first match's
-    center, or None."""
+def find_text_matches(target_text: str):
+    """OCR the active window (not the whole screen) and return EVERY match for
+    target_text as a list of (center_x, center_y, (left, top, width, height))
+    tuples in absolute screen coordinates. Empty list if nothing matches.
+
+    find_text_on_screen() wraps this for callers that only want the first hit;
+    the bounding boxes are what the color tiebreaker needs to sample each
+    candidate's on-screen area."""
     active = gw.getActiveWindow()
 
     if active is not None and active.width > 0 and active.height > 0:
@@ -160,27 +166,149 @@ def find_text_on_screen(target_text: str):
     data = pytesseract.image_to_data(screenshot, output_type=pytesseract.Output.DICT)
 
     target_lower = target_text.lower().strip()
-    n_boxes = len(data['text'])
+    matches = []
 
-    for i in range(n_boxes):
+    for i in range(len(data['text'])):
         word = data['text'][i].strip().lower()
         if not word:
             continue
         # simple substring match — good enough for single words/short phrases
         if target_lower in word or word in target_lower:
-            x = offset_x + data['left'][i] + data['width'][i] // 2
-            y = offset_y + data['top'][i] + data['height'][i] // 2
-            return (x, y)
+            l = offset_x + data['left'][i]
+            t = offset_y + data['top'][i]
+            w = data['width'][i]
+            h = data['height'][i]
+            matches.append((l + w // 2, t + h // 2, (l, t, w, h)))
 
-    return None
+    return matches
+
+
+def find_text_on_screen(target_text: str):
+    """(x, y) center of the first on-screen match for target_text, or None."""
+    matches = find_text_matches(target_text)
+    return (matches[0][0], matches[0][1]) if matches else None
+
+
+def _padded_region_shot(l, t, w, h, pad_ratio=0.4):
+    """Screenshot a box padded around (l, t, w, h) so a button's fill — not
+    just its text glyphs — is included when we sample its color. Clamped to
+    the screen so an edge element can't ask for an off-screen region."""
+    pad_x = int(w * pad_ratio)
+    pad_y = int(h * pad_ratio)
+    rl = max(0, l - pad_x)
+    rt = max(0, t - pad_y)
+    sw, sh = pyautogui.size()
+    rw = min(w + 2 * pad_x, sw - rl)
+    rh = min(h + 2 * pad_y, sh - rt)
+    if rw <= 0 or rh <= 0:
+        return pyautogui.screenshot(region=(max(0, l), max(0, t), max(1, w), max(1, h)))
+    return pyautogui.screenshot(region=(rl, rt, rw, rh))
+
+
+def _pick_by_color(matches, color, floor=0.06):
+    """Among OCR matches [(cx, cy, box), ...], return the (x, y) of the one
+    whose padded region most strongly shows `color`. Falls back to the first
+    match if none clearly show the color (the color was only a hint — better
+    to click the text we found than to refuse)."""
+    best = None  # (fraction, (cx, cy))
+    for cx, cy, (l, t, w, h) in matches:
+        try:
+            region = _padded_region_shot(l, t, w, h)
+            frac = color_vision.color_fraction(region, color)
+        except Exception:
+            frac = 0.0
+        if best is None or frac > best[0]:
+            best = (frac, (cx, cy))
+    if best and best[0] >= floor:
+        return best[1]
+    return (matches[0][0], matches[0][1])
 
 
 def click_text(target_text: str) -> str:
-    pos = find_text_on_screen(target_text)
-    if pos is None:
-        return f"couldn't find '{target_text}' on screen"
+    # A color word ("red submit") is a disambiguator, not part of the text to
+    # find — pull it out and use it to choose among look-alike matches.
+    color, text = color_vision.extract_color(target_text)
+    locate = text if (color and text) else target_text
+
+    matches = find_text_matches(locate)
+    if matches:
+        if color and len(matches) > 1:
+            pos = _pick_by_color(matches, color)
+            return _do_click(pos, f"the {color} '{locate}'")
+        # One match (color moot) or no color asked for: click the first hit.
+        return _do_click((matches[0][0], matches[0][1]),
+                         f"the {color} '{locate}'" if color else f"'{locate}'")
+
+    # OCR found no text. Fall back to the Windows UI Automation tree, which
+    # exposes icon-only controls (hamburger menu, gear, back arrow, close X)
+    # by their accessible name. Lazy import + guarded so a machine without the
+    # UIA library still runs everything else.
+    try:
+        from ui_automation import find_control_center
+        pos = find_control_center(locate)
+        if pos is not None:
+            print(f"(no visible text — matched '{locate}' "
+                  f"via the accessibility tree)")
+            return _do_click(pos, f"'{locate}'")
+    except Exception:
+        pass
+
+    return f"couldn't find '{target_text}' on screen"
+
+
+def _do_click(pos, label) -> str:
     pyautogui.click(pos[0], pos[1])
-    return f"clicked '{target_text}' at {pos}"
+    return f"clicked {label} at {pos}"
+
+
+def get_color(target: str = "") -> str:
+    """Name a color on screen: the pixel under the cursor (empty / "this" /
+    "here" target), or the dominant color of a named element ("what color is
+    the submit button")."""
+    cleaned = (target or "").strip().strip(".!?,").strip().lower()
+    cursor_words = {
+        "", "this", "that", "it", "here", "cursor", "the cursor",
+        "under the cursor", "mouse", "pointer", "the pointer",
+    }
+
+    if cleaned in cursor_words:
+        try:
+            x, y = pyautogui.position()
+            r, g, b = pyautogui.pixel(x, y)
+        except Exception as e:
+            return f"couldn't read the color under the cursor: {e}"
+        return (f"the color under the cursor is {color_vision.name_color(r, g, b)} "
+                f"(RGB {r}, {g}, {b})")
+
+    # Named element: bring the tracked app forward (so we OCR the right
+    # window), locate the element (OCR first, then the accessibility tree),
+    # and name the dominant color of its area.
+    if _current_focus_app:
+        focus_app(_current_focus_app)
+
+    matches = find_text_matches(cleaned)
+    if matches:
+        _, _, box = matches[0]
+        try:
+            region = _padded_region_shot(*box)
+            cname = color_vision.dominant_chromatic_color(region)
+        except Exception as e:
+            return f"found '{cleaned}' but couldn't read its color: {e}"
+        return f"the '{cleaned}' looks {cname}"
+
+    pos = None
+    try:
+        from ui_automation import find_control_center
+        pos = find_control_center(cleaned)
+    except Exception:
+        pos = None
+    if pos is None:
+        return f"couldn't find '{cleaned}' on screen to read its color"
+    try:
+        r, g, b = pyautogui.pixel(pos[0], pos[1])
+    except Exception as e:
+        return f"found '{cleaned}' but couldn't read its color: {e}"
+    return f"the '{cleaned}' looks {color_vision.name_color(r, g, b)}"
 
 
 def type_text(text: str) -> str:

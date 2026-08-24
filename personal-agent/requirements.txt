@@ -1,0 +1,4 @@
+# UI Automation fallback for click_text: lets the agent click icon-only
+# controls (hamburger menu, gear, close X) by their accessible name when OCR
+# finds no visible text. Pulls in comtypes automatically. See ui_automation.py.
+uiautomation>=2.0
