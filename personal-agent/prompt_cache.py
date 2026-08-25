@@ -56,6 +56,12 @@ def get_cached_action(prompt: str):
     """Return the cached action dict for this exact (normalized) prompt,
     or None if it hasn't been seen before."""
     key = normalize_prompt(prompt)
+    if not key:
+        # A blank / punctuation-only prompt normalizes to "". That's never a
+        # real command, and matching it would replay whatever bogus action a
+        # stray empty utterance once got saved under (a "" -> open brave entry
+        # is exactly how a bare wake word "agent." started opening Brave).
+        return None
     cache = _load_cache()
 
     entry = cache.get(key)
@@ -72,6 +78,10 @@ def get_cached_action(prompt: str):
 def save_action(prompt: str, action: dict) -> None:
     """Remember what Qwen decided for this prompt, for next time."""
     key = normalize_prompt(prompt)
+    if not key:
+        # Never cache under the empty key — see get_cached_action. This is the
+        # write-side guard that stops the "" poison entry from ever coming back.
+        return
     cache = _load_cache()
 
     cache[key] = {

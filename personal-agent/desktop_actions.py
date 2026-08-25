@@ -1,5 +1,6 @@
 import os
 import time
+from collections import namedtuple
 from pathlib import Path
 
 import pyautogui
@@ -8,6 +9,7 @@ import pygetwindow as gw
 from PIL import Image
 
 import color_vision
+import disambiguation
 
 pyautogui.PAUSE = 0.1  # small delay after each pyautogui call, avoids race conditions
 
@@ -16,6 +18,18 @@ pytesseract.pytesseract.tesseract_cmd = r"C:\Program Files\Tesseract-OCR\tessera
 # How far one "scroll up/down" command moves. pyautogui.scroll() takes
 # wheel "clicks"; this is a moderate, clearly-visible step. Tunable.
 SCROLL_STEP = 500
+
+# OCR confidence (0-100) below which a *fuzzy* (non-exact) text match is treated
+# as noise and dropped. An exact word match is always kept, however low its
+# confidence — if OCR read the exact word, we trust it. Tunable.
+CONF_FLOOR = 40
+
+# One scored OCR (or consolidated) match:
+#   cx, cy : click point (center), absolute screen coords
+#   box    : (left, top, width, height), absolute screen coords
+#   score  : match quality (exact vs partial) x OCR confidence, 0.0-1.0
+#   exact  : the OCR word equalled the target exactly
+Match = namedtuple("Match", ["cx", "cy", "box", "score", "exact"])
 
 
 # Tracks which app the agent currently considers "in focus" — set by
@@ -144,49 +158,185 @@ def close_app(target: str = "") -> str:
     return f"closed {app_label}"
 
 
-def find_text_matches(target_text: str):
-    """OCR the active window (not the whole screen) and return EVERY match for
-    target_text as a list of (center_x, center_y, (left, top, width, height))
-    tuples in absolute screen coordinates. Empty list if nothing matches.
-
-    find_text_on_screen() wraps this for callers that only want the first hit;
-    the bounding boxes are what the color tiebreaker needs to sample each
-    candidate's on-screen area."""
+def _active_window_bounds():
+    """(left, top, width, height) of the active window in absolute screen
+    coords, or the full screen if no active-window info is available. The one
+    source of truth for both OCR region and position labels."""
     active = gw.getActiveWindow()
-
     if active is not None and active.width > 0 and active.height > 0:
-        left, top, width, height = active.left, active.top, active.width, active.height
-        screenshot = pyautogui.screenshot(region=(left, top, width, height))
-        offset_x, offset_y = left, top
+        return (active.left, active.top, active.width, active.height)
+    sw, sh = pyautogui.size()
+    return (0, 0, sw, sh)
+
+
+def _conf_val(raw) -> float:
+    """pytesseract conf comes through as a str ('96') or number, with -1 for
+    non-text rows. Coerce to float; unparseable -> -1 (treated as no text)."""
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        return -1.0
+
+
+def _lrtb(box):
+    """(left, top, width, height) -> (left, top, right, bottom)."""
+    l, t, w, h = box
+    return l, t, l + w, t + h
+
+
+def _group_bounds(group):
+    """Union (left, top, right, bottom) over a group of Matches' boxes."""
+    ls = [_lrtb(m.box) for m in group]
+    return (min(x[0] for x in ls), min(x[1] for x in ls),
+            max(x[2] for x in ls), max(x[3] for x in ls))
+
+
+def _boxes_mergeable(group_lrtb, box) -> bool:
+    """Should `box` join a group whose union is `group_lrtb`? True when they're
+    on the same text line (vertical spans overlap) AND horizontally overlap or
+    sit within a small gap — the signature of one label OCR split into separate
+    word boxes ('Sign' + 'In'). The gap threshold is a fraction of line height,
+    kept small so two genuinely separate same-text buttons on one line stay
+    distinct (they're normally spaced much further apart)."""
+    gl, gt, gr, gb = group_lrtb
+    bl, bt, br, bb = _lrtb(box)
+
+    if min(gb, bb) - max(gt, bt) <= 0:  # no vertical overlap -> different lines
+        return False
+
+    if bl > gr:
+        h_gap = bl - gr
+    elif gl > br:
+        h_gap = gl - br
     else:
-        # Fallback: no active window info available, scan everything.
-        screenshot = pyautogui.screenshot()
-        offset_x, offset_y = 0, 0
+        h_gap = 0  # horizontally overlapping
+    line_h = min(gb - gt, bb - bt)
+    return h_gap <= 0.6 * max(line_h, 1)
+
+
+def _combine(group) -> Match:
+    """Collapse a group of Matches into one: union box + center, best score,
+    exact if any member was exact."""
+    gl, gt, gr, gb = _group_bounds(group)
+    w, h = gr - gl, gb - gt
+    return Match((gl + gr) // 2, (gt + gb) // 2, (gl, gt, w, h),
+                 max(m.score for m in group), any(m.exact for m in group))
+
+
+def _merge_matches(matches):
+    """Coalesce boxes that belong to one on-screen element (overlapping, or an
+    adjacent same-line word fragment). O(n^2) transitive grouping — n is the
+    handful of OCR hits for one target, so this is cheap."""
+    if not matches:
+        return []
+    used = [False] * len(matches)
+    out = []
+    for i in range(len(matches)):
+        if used[i]:
+            continue
+        group = [matches[i]]
+        used[i] = True
+        changed = True
+        while changed:
+            changed = False
+            bounds = _group_bounds(group)
+            for j in range(len(matches)):
+                if used[j]:
+                    continue
+                if _boxes_mergeable(bounds, matches[j].box):
+                    group.append(matches[j])
+                    used[j] = True
+                    changed = True
+        out.append(_combine(group))
+    return out
+
+
+def find_text_matches(target_text: str):
+    """OCR the active window (not the whole screen) and return the scored,
+    consolidated matches for target_text as a list of Match tuples in absolute
+    screen coordinates, best-first. Empty list if nothing matches.
+
+    Beyond finding hits, this ranks them: an exact word match outranks a partial
+    one, and OCR's own per-word confidence breaks ties and filters noise (a
+    low-confidence fuzzy hit is dropped). Overlapping/adjacent same-line boxes
+    are merged so a split label ('Sign' + 'In') or a multi-word target counts as
+    one candidate, not several — which is what keeps the disambiguation prompt
+    from firing on OCR artefacts. find_text_on_screen() wraps this for callers
+    that only want the best hit."""
+    left, top, width, height = _active_window_bounds()
+    screenshot = pyautogui.screenshot(region=(left, top, width, height))
+    offset_x, offset_y = left, top
 
     data = pytesseract.image_to_data(screenshot, output_type=pytesseract.Output.DICT)
 
     target_lower = target_text.lower().strip()
-    matches = []
+    raw = []
 
     for i in range(len(data['text'])):
         word = data['text'][i].strip().lower()
         if not word:
             continue
-        # simple substring match — good enough for single words/short phrases
-        if target_lower in word or word in target_lower:
-            l = offset_x + data['left'][i]
-            t = offset_y + data['top'][i]
-            w = data['width'][i]
-            h = data['height'][i]
-            matches.append((l + w // 2, t + h // 2, (l, t, w, h)))
 
-    return matches
+        # Match quality: an exact word beats a prefix/superstring, which beats a
+        # fragment of a multi-word target. (Old behaviour treated all three as
+        # equal, unranked hits — this is the ranking it was missing.)
+        exact = (word == target_lower)
+        if exact:
+            quality = 1.0
+        elif word.startswith(target_lower) or target_lower in word:
+            quality = 0.6
+        elif word in target_lower:
+            quality = 0.4
+        else:
+            continue
+
+        conf = _conf_val(data['conf'][i])
+        if not exact and conf < CONF_FLOOR:
+            continue  # low-confidence fuzzy hit -> OCR noise, drop it
+
+        l = offset_x + data['left'][i]
+        t = offset_y + data['top'][i]
+        w = data['width'][i]
+        h = data['height'][i]
+        score = quality * max(conf, 0.0) / 100.0
+        raw.append(Match(l + w // 2, t + h // 2, (l, t, w, h), score, exact))
+
+    merged = _merge_matches(raw)
+    # Exact matches first, then by score — so the best candidate is matches[0]
+    # for callers that only want one, and the numbered list reads best-first.
+    merged.sort(key=lambda m: (m.exact, m.score), reverse=True)
+    return merged
 
 
 def find_text_on_screen(target_text: str):
-    """(x, y) center of the first on-screen match for target_text, or None."""
+    """(x, y) center of the best on-screen match for target_text, or None."""
     matches = find_text_matches(target_text)
-    return (matches[0][0], matches[0][1]) if matches else None
+    return (matches[0].cx, matches[0].cy) if matches else None
+
+
+def describe_position(box, win_bounds) -> str:
+    """A short human position label for a box's center within the active
+    window, over a 3x3 grid: 'top-left', 'center', 'bottom-right', or just
+    'top'/'left' for the mid row/column. Used to tell duplicate matches apart
+    in the disambiguation prompt."""
+    l, t, w, h = box
+    cx, cy = l + w / 2.0, t + h / 2.0
+    wl, wt, ww, wh = win_bounds
+    if ww <= 0 or wh <= 0:
+        return "somewhere"
+
+    fx = (cx - wl) / ww
+    fy = (cy - wt) / wh
+    col = "left" if fx < 1 / 3 else ("right" if fx > 2 / 3 else "center")
+    row = "top" if fy < 1 / 3 else ("bottom" if fy > 2 / 3 else "middle")
+
+    if row == "middle" and col == "center":
+        return "center"
+    if col == "center":
+        return row       # "top" / "bottom"
+    if row == "middle":
+        return col       # "left" / "right"
+    return f"{row}-{col}"  # "top-left", "bottom-right", ...
 
 
 def _padded_region_shot(l, t, w, h, pad_ratio=0.4):
@@ -205,26 +355,32 @@ def _padded_region_shot(l, t, w, h, pad_ratio=0.4):
     return pyautogui.screenshot(region=(rl, rt, rw, rh))
 
 
-def _pick_by_color(matches, color, floor=0.06):
-    """Among OCR matches [(cx, cy, box), ...], return the (x, y) of the one
-    whose padded region most strongly shows `color`. Falls back to the first
-    match if none clearly show the color (the color was only a hint — better
-    to click the text we found than to refuse)."""
-    best = None  # (fraction, (cx, cy))
-    for cx, cy, (l, t, w, h) in matches:
+def _filter_by_color(matches, color, floor=0.06):
+    """Return the subset of Matches whose padded region clearly shows `color`
+    (color fraction >= floor). Empty if none do — the caller decides whether to
+    fall back to ignoring the color hint.
+
+    This replaces the old 'pick whichever shows it most' tiebreaker: with the
+    user-approved 'ask whenever 2+ remain' rule, when several candidates still
+    qualify we hand them ALL back so click_text can ask, rather than silently
+    guessing the strongest."""
+    strong = []
+    for m in matches:
         try:
-            region = _padded_region_shot(l, t, w, h)
+            region = _padded_region_shot(*m.box)
             frac = color_vision.color_fraction(region, color)
         except Exception:
             frac = 0.0
-        if best is None or frac > best[0]:
-            best = (frac, (cx, cy))
-    if best and best[0] >= floor:
-        return best[1]
-    return (matches[0][0], matches[0][1])
+        if frac >= floor:
+            strong.append(m)
+    return strong
 
 
-def click_text(target_text: str) -> str:
+def click_text(target_text: str):
+    """Locate target_text in the active window and click it. Returns a result
+    string, OR — when 2+ equally-plausible matches remain after scoring and
+    consolidation — an AmbiguousClick for process_command to resolve with the
+    user (never a silent guess between rival matches)."""
     # A color word ("red submit") is a disambiguator, not part of the text to
     # find — pull it out and use it to choose among look-alike matches.
     color, text = color_vision.extract_color(target_text)
@@ -232,12 +388,25 @@ def click_text(target_text: str) -> str:
 
     matches = find_text_matches(locate)
     if matches:
+        candidates = matches
         if color and len(matches) > 1:
-            pos = _pick_by_color(matches, color)
-            return _do_click(pos, f"the {color} '{locate}'")
-        # One match (color moot) or no color asked for: click the first hit.
-        return _do_click((matches[0][0], matches[0][1]),
-                         f"the {color} '{locate}'" if color else f"'{locate}'")
+            # Color is an explicit disambiguator: narrow to matches that
+            # actually show it. Exactly one -> click it; several -> ask among
+            # those; none -> the color didn't help, fall back to all matches.
+            narrowed = _filter_by_color(matches, color)
+            if len(narrowed) == 1:
+                m = narrowed[0]
+                return _do_click((m.cx, m.cy), f"the {color} '{locate}'")
+            candidates = narrowed if narrowed else matches
+
+        if len(candidates) == 1:
+            m = candidates[0]
+            label = f"the {color} '{locate}'" if color else f"'{locate}'"
+            return _do_click((m.cx, m.cy), label)
+
+        # 2+ genuinely-distinct candidates remain: don't gamble on matches[0]
+        # (the old coin flip) — surface the ambiguity so the user picks.
+        return _build_ambiguous(locate, candidates)
 
     # OCR found no text. Fall back to the Windows UI Automation tree, which
     # exposes icon-only controls (hamburger menu, gear, back arrow, close X)
@@ -256,9 +425,46 @@ def click_text(target_text: str) -> str:
     return f"couldn't find '{target_text}' on screen"
 
 
+def _build_ambiguous(locate, candidates):
+    """Package 2+ rival matches into an AmbiguousClick for the disambiguation
+    gate. Each candidate gets a position label; a color name is added only when
+    the candidates differ in color, so three 'submit' buttons in different spots
+    read by position while a red/green pair reads by color — and a same-color
+    set doesn't clutter the prompt with a redundant color on every line."""
+    win = _active_window_bounds()
+
+    colors = []
+    for m in candidates:
+        try:
+            region = _padded_region_shot(*m.box)
+            colors.append(color_vision.dominant_chromatic_color(region))
+        except Exception:
+            colors.append(None)
+    show_color = len({c for c in colors if c}) > 1
+
+    cand_dicts = [
+        {
+            "x": m.cx,
+            "y": m.cy,
+            "desc": describe_position(m.box, win),
+            "color": (col if show_color else None),
+        }
+        for m, col in zip(candidates, colors)
+    ]
+    return disambiguation.AmbiguousClick(text=locate, candidates=cand_dicts)
+
+
 def _do_click(pos, label) -> str:
     pyautogui.click(pos[0], pos[1])
     return f"clicked {label} at {pos}"
+
+
+def click_at(x, y, label="that") -> str:
+    """Click an absolute screen coordinate the user chose during
+    disambiguation. Separate from _do_click so the disambiguation handler can
+    construct a click straight from a candidate's stored (x, y)."""
+    pyautogui.click(x, y)
+    return f"clicked {label} at ({x}, {y})"
 
 
 def get_color(target: str = "") -> str:
@@ -288,7 +494,7 @@ def get_color(target: str = "") -> str:
 
     matches = find_text_matches(cleaned)
     if matches:
-        _, _, box = matches[0]
+        box = matches[0].box
         try:
             region = _padded_region_shot(*box)
             cname = color_vision.dominant_chromatic_color(region)

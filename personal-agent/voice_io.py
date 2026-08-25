@@ -33,6 +33,9 @@ import speech_recognition as sr
 import pyttsx3
 from faster_whisper import WhisperModel
 
+import confirmation  # so a yes/no answer isn't swallowed by the local cancel shortcut
+import disambiguation  # likewise, so a pick ("two", "the top one") isn't swallowed
+
 WAKE_WORD = "agent"
 WAKE_WORD_ALIASES = {
     WAKE_WORD,
@@ -590,7 +593,12 @@ def voice_loop(on_command):
                     # Direct command (no wake word) — entire transcript is the command.
                     after_wake = transcript_lower
 
-                if after_wake:
+                # A bare wake word often arrives with trailing punctuation
+                # ("agent." -> after_wake "."), which is NOT a command. Only
+                # treat after_wake as the command when it has real (alphanumeric)
+                # content; a punctuation-only remainder falls through to the
+                # follow-up listen instead of becoming an empty command.
+                if after_wake and re.search(r"[a-z0-9]", after_wake):
                     command_text = after_wake
                 else:
                     # Just "agent" was said alone — do a dedicated follow-up listen
@@ -621,8 +629,14 @@ def voice_loop(on_command):
                     _drain(source)
                     continue
 
-                if _is_cancel(command_text):
+                if (not confirmation.is_pending()
+                        and not disambiguation.is_pending()
+                        and _is_cancel(command_text)):
                     # "never mind" / "cancel" — abort quietly, no LLM call.
+                    # Skipped while a destructive action is awaiting yes/no or a
+                    # click is awaiting a pick: there, these words mean "cancel
+                    # that", so they must reach on_command -> the pipeline's
+                    # handlers instead of being handled locally here.
                     print(f"\r(heard: '{command_text}') — cancelled            ")
                     log_utterance(command_text, kind="command")
                     _write_state("idle")

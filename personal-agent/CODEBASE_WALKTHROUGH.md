@@ -1,6 +1,6 @@
 # Personal Agent Codebase Walkthrough
 
-This repository is a local-first Windows personal agent prototype. The current working version accepts typed commands or voice commands, uses a local Ollama/Qwen model to convert user text into one structured JSON action, and executes it through trusted Python code.
+This repository is a local-first Windows personal agent prototype. The current working version accepts typed commands or voice commands, uses a local Ollama/Qwen model to convert user text into a structured JSON action — a single action, or an ordered **sequence** of actions when the user chains several requests in one breath ("open brave, go to youtube, and search for cats") — and executes it through trusted Python code.
 
 The current milestone is:
 
@@ -25,8 +25,10 @@ personal-agent/
   desktop_actions.py   Focuses windows, performs OCR, clicks, types, and presses keys.
   ui_automation.py     Clicks icon-only controls by accessible name via the Windows UIA tree (click_text's fallback when OCR finds no text).
   color_vision.py      Names on-screen colors (get_color) and disambiguates same-text matches by color for click_text.
+  confirmation.py      Yes/no gate in front of destructive actions (close_app, close/quit key combos) so a misheard command can't close a window instantly.
+  disambiguation.py    "Which one?" gate: when click_text finds 2+ rival matches, lists them (number + position/color) and lets the next utterance pick one.
   voice_io.py          Wake-word listening, Faster Whisper, TTS, state, and voice logs.
-  pet_ui.py             Optional Tkinter desktop pet driven by agent_state.json.
+  video_pet.py          Small always-on-top looping video pet (bottom-right, click-through); auto-launched by agent.py, keys the clip background out at runtime, plays audio once, loops silently, and exits with the agent.
   record_test.py        Records a WAV file to diagnose microphone capture.
   list_mics.py          Lists available microphone devices.
   brain.py              Empty placeholder; LLM logic currently lives in agent.py.
@@ -179,6 +181,161 @@ numeric string.
 `click_text` also accepts a leading color word ("red submit"): the color is
 stripped from the text to locate and used to disambiguate look-alike matches
 (see `color_vision.py`).
+
+For a multi-step request the model instead emits an ordered list of those same
+actions — either wrapped as `{"steps": [ ... ]}` or as a bare top-level array:
+
+```json
+{"steps":[
+  {"action":"open_app","target":"brave"},
+  {"action":"wait","target":2},
+  {"action":"press_key","target":"ctrl+l"},
+  {"action":"type_text","target":"youtube.com"},
+  {"action":"press_key","target":"enter"}
+]}
+```
+
+See **Multi-Step Sequences** below for how that list is normalized, validated,
+and run.
+
+## Confirmation Gate (Destructive Actions)
+
+`confirmation.py` sits inside `process_command`, right after an action is
+resolved (from a builtin, the cache, or Qwen) and just before it executes — the
+one point every action funnels through, so it catches destructive commands from
+all three sources at once.
+
+Gated actions (a misheard one could close a window in under a second):
+
+- `close_app` (any target).
+- `press_key` with a closing/quitting combo: `alt+f4`, `ctrl+w`, `ctrl+f4`,
+  `ctrl+shift+w`, `ctrl+q`, `ctrl+shift+q` (matched order/space/case-insensitively).
+
+Instead of blocking (which would freeze the voice listen loop), it's a small
+state machine:
+
+1. A destructive action is *armed* — stashed, not run — and the agent replies
+   "That will close … — say 'yes' to confirm or 'no' to cancel."
+2. The next command is read as the answer: an affirmation ("yes", "do it")
+   runs it; a denial ("no", "cancel") drops it; anything else drops it and is
+   handled as a fresh command. "yes"/"no" never reach Qwen or the cache.
+3. An armed action expires after `CONFIRM_TIMEOUT_S` (30s), so a stray later
+   "yes" can't fire a forgotten close.
+
+A killed window can't be truly undone, so confirmation is the real protection.
+Where a genuine one-key recovery exists — a closed tab reopens with
+`ctrl+shift+t` — the confirmed reply appends "(say 'reopen tab' to undo)".
+Text and voice both share this via `process_command`; the exit/forget/cancel
+shortcuts in each mode step aside while an answer is pending.
+
+## Ambiguous-Click Disambiguation
+
+A screen often shows the same label in several places — three "Submit" buttons,
+a page full of "Download" links. `click_text` used to click `matches[0]` (the
+first box OCR happened to return), so "click submit" among three submits was a
+coin flip. Two changes fix this.
+
+**1. Confidence scoring + consolidation (`desktop_actions.find_text_matches`).**
+`pytesseract.image_to_data` already returns a per-word confidence (0–100) that
+the old code discarded. Now each OCR word that matches is scored:
+
+- **quality** — exact word (`1.0`) beats a prefix/superstring (`0.6`) beats a
+  fragment of a multi-word target (`0.4`);
+- a low-confidence *fuzzy* hit (`conf < CONF_FLOOR`, ~40) is dropped as noise
+  (an exact word is always kept, however low its confidence);
+- `score = quality × conf/100`;
+- overlapping / adjacent same-line boxes are **merged** into one candidate, so a
+  split label ("Sign" + "In") or a multi-word target isn't miscounted as several
+  targets;
+- results come back as `Match(cx, cy, box, score, exact)` tuples, **exact-first
+  then by score**. Callers that want just one (`find_text_on_screen`,
+  `get_color`) now get the best-scored hit instead of the first — a free
+  accuracy win.
+
+**2. Numbered pick (`disambiguation.py`).** When 2+ genuinely-distinct
+candidates remain, `click_text` doesn't guess — it returns an `AmbiguousClick`
+(text + a list of candidates, each with `x`, `y`, a position `desc` like
+"top-left", and a `color` when the candidates differ in color). This mirrors
+`confirmation.py` exactly:
+
+1. `process_command` arms the `AmbiguousClick` and speaks/prints a numbered
+   list: *"I found 3 'submit' matches: 1) top-left, 2) center (red), 3)
+   bottom-right. Say a number, or e.g. 'the top one'."*
+2. The user's NEXT utterance is the pick, interpreted **before** the
+   builtins/cache/LLM so a selection word can't collide with a command:
+     - a number / ordinal ("2", "two", "the second one"), a position ("top
+       left"), or a color ("the red one") → click that candidate via the
+       internal `click_at` action;
+     - "no" / "cancel" / "never mind" → cancel, nothing clicked;
+     - anything else → drop the pending selection and treat it as a fresh
+       command.
+3. An armed selection expires after `SELECT_TIMEOUT_S` (30s), which bounds how
+   stale the stored coordinates can get if the window moved after the prompt.
+
+Because the pick lands a turn after the prompt (focus has usually returned to
+this terminal by then), the `click_at` handler in `actions.py` re-focuses the
+tracked app before clicking — the same reason `click_text` does. `click_at` is
+**internal only**: it's not in `ALLOWED_ACTIONS`, never emitted by Qwen, and the
+disambiguation handler builds it directly, so `validate_action` is bypassed for
+it. If the user named a color and exactly one candidate shows it, that resolves
+immediately without a prompt; two-plus still ask.
+
+## Multi-Step Sequences
+
+Users naturally chain steps in one sentence — *"open notepad, type hello, and
+save"*. To serve that without breaking the single-action design, a multi-step
+plan is folded into one **composite** action:
+
+```json
+{"action":"sequence","steps":[ {"action":"…","target":"…"}, … ]}
+```
+
+`sequence` is an internal orchestration type: it is **not** in `ALLOWED_ACTIONS`
+and is never handed to `actions.execute_action` as a whole — a runner in
+`agent.py` feeds it one step at a time. A step may not itself be a `sequence`
+(no nesting).
+
+The path through `process_command`, added around the existing pipeline:
+
+1. **Normalize** (`normalize_action`, called once right before validation, so
+   every source — builtin, cache, LLM — is treated identically). It folds the
+   several shapes the model might emit into just two: a single-action dict, or a
+   `sequence`. `{"steps":[A,B]}` and `[A,B]` become a `sequence`; a one-item
+   plan (`{"steps":[A]}` / `[A]`) is **unwrapped** to just `A`, so a trivial
+   plan takes the ordinary single-action path and single-command behavior is
+   byte-for-byte unchanged. It is idempotent.
+2. **Extract** — because a plan can arrive as a top-level `[ … ]` array, the
+   JSON extractor branches on the leading character (`[` → match `[...]`, else
+   `{...}`); a greedy `{.*}` alone would drop an array's brackets. `num_predict`
+   was also raised (80 → 512) so a multi-step plan isn't truncated mid-JSON.
+3. **Validate** — a `sequence` branch checks the wrapper (a list of `2 …
+   MAX_STEPS` steps, `MAX_STEPS = 12`) and recurses into each step with the
+   existing single-action validator; a nested `sequence` or any bad step is
+   rejected.
+4. **Run** (`_run_sequence`) — execute each step in order via the same
+   `execute_action`, then return one aggregated reply. `_dispatch` unifies the
+   two shapes: a single action runs exactly as before; a `sequence` goes to the
+   runner.
+
+The two interactive gates carry over to a batch:
+
+- **Confirm the whole batch up front.** `confirmation.needs_confirmation` is
+  true for a sequence if *any* step is destructive; the reply then describes the
+  whole batch and names the destructive step(s) — *"That will run 3 steps,
+  including one that will close this tab…"* — and asks once. On "yes" the entire
+  sequence runs (no per-step re-prompt); the "reopen tab" hint still appears if a
+  closed tab is reversible.
+- **Ask & resume on an ambiguous click.** If a `click_text` step mid-sequence
+  finds 2+ rival matches, the runner arms the disambiguation gate with the
+  **remaining steps** as a resume tail (`disambiguation.arm(ambig,
+  resume_steps=…)`) and returns the numbered prompt, prefixed with what already
+  ran. The user's pick clicks the chosen candidate and then `_run_sequence`
+  continues the tail — re-arming itself if a later step is ambiguous too. On
+  cancel/expiry the whole pending state (tail included) is dropped.
+
+Hermetic coverage lives in `test_sequence.py` (normalize/validate/run plus both
+gate flows and the raw-LLM parse path); the confirmation and disambiguation
+suites still pass unchanged, so single-step behavior is verified intact.
 
 ## `Modelfile`
 
@@ -499,9 +656,16 @@ audio after each command so the agent does not immediately hear its own TTS.
 The default microphone follows the current Windows default input device.
 `--mic INDEX` pins one device. The loop detects default-device changes and
 reconnects automatically. `agent_state.json` carries `idle`, `listening`,
-`thinking`, and `speaking` states. `pet_ui.py` polls this file and animates an
-optional always-on-top Tkinter overlay. `voice_log.json` records heard phrases,
+`thinking`, and `speaking` states. `voice_log.json` records heard phrases,
 commands, and spoken responses.
+
+The desktop pet is `video_pet.py`: a small, click-through, always-on-top looping
+video pinned to the bottom-right corner, auto-launched by `agent.py` at startup.
+It decodes `pet_video.mp4` with PyAV, keys the clip's baked-in background out at
+runtime so only the cat floats, plays the clip's audio once, then loops silently
+and exits automatically when the agent process exits. It loops independently of
+the `agent_state.json` states above (unlike the old `pet_ui.py` sprite it
+replaced, which animated per state).
 
 ## Cache Files
 
@@ -607,6 +771,17 @@ The current project can:
   (hamburger menu, gear, close X) that have no visible text for OCR to read.
 - Name on-screen colors, and use a spoken color word to pick the right control
   among same-text look-alikes ("click the red submit button").
+- Guard destructive actions (closing a window, tab, or app) behind a spoken/typed
+  yes/no confirmation, so a misheard command can't close something instantly; a
+  closed tab comes with a "reopen tab" undo hint.
+- Rank OCR matches by confidence (exact-vs-partial × per-word `conf`), drop
+  low-confidence noise, and merge split/adjacent boxes — then, when 2+ rival
+  matches for one click remain, list them numbered (position + color) and let
+  the next utterance pick one instead of guessing.
+- Carry out multi-step commands ("open brave, go to youtube, and search for
+  cats") as one ordered sequence, running each step in order — confirming the
+  whole batch once up front if any step is destructive, and pausing to ask
+  "which one?" then resuming the rest if a click mid-sequence is ambiguous.
 
 ## Not Yet Built
 

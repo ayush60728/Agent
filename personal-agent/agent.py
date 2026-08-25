@@ -594,9 +594,121 @@ EXIT_WORDS = {"exit", "quit", "stop", "bye"}
 VOICE_EXIT_WORDS = {"exit", "quit", "bye", "goodbye"}
 
 
-def _run_sequence(steps, _prefix=None):
+# --- speech-friendly summaries (voice mode only) ---------------------------
+# In voice mode the reply is spoken aloud, so the verbose per-step aggregation
+# ("Opened brave.; waited 2.0s; pressed 'ctrl+l'; typed 'youtube.com'; pressed
+# 'enter'") is the wrong shape — the user wants a short, natural "here's what
+# I'm doing", not a machine log read back at them. These helpers turn an
+# action/plan into that short spoken form. Text mode never uses them (it keeps
+# the detailed strings, which are useful to read); they're gated behind
+# process_command(..., for_speech=True).
+
+def _brief_single(action: dict, result: str) -> str:
+    """Short spoken version of a single action's result. Text mode never sees
+    this — only voice mode, via process_command(..., for_speech=True)."""
+    kind = action.get("action")
+    target = str(action.get("target") or "").strip()
+    low = (result or "").lower()
+
+    # Informational or failure results carry the actual content the user
+    # needs — never shorten those away.
+    if kind == "get_color":
+        return result
+    if low.startswith(("couldn't", "error", "i don't recognise", "i can only",
+                        "action rejected", "i need a key")):
+        return result
+
+    if kind in ("open_app", "open_folder") and low.startswith(("opened", "launched")):
+        return f"Opened {target}." if target else result
+    if kind == "focus_app" and low.startswith("switched"):
+        return f"Switched to {target}." if target else result
+    if kind == "close_app" and low.startswith("closed"):
+        return result  # already short ("closed brave")
+    if kind == "click_text" and low.startswith("clicked"):
+        return f"Clicked {target}." if target else "Clicked it."
+    if kind == "type_text":
+        return "Typed that in."
+    if kind == "press_key":
+        return f"Pressed {target}." if target else result
+    if kind == "scroll":
+        return f"Scrolled {target}." if target else result
+    if kind == "screenshot":
+        return "Saved a screenshot."
+    if kind == "wait":
+        return ""  # nothing worth saying
+
+    return result
+
+
+def _brief_phrases(steps) -> list[str]:
+    """Turn a sequence's steps into a handful of short present-tense phrases,
+    collapsing the ctrl+l -> type_text -> enter navigation pattern into one
+    'going to X' phrase, and dropping mechanical steps (wait, bare enter)."""
+    phrases = []
+    i, n = 0, len(steps)
+    while i < n:
+        step = steps[i]
+        kind = step.get("action")
+        target = str(step.get("target") or "").strip()
+
+        if kind == "open_app":
+            phrases.append(f"opening {target}")
+            i += 1
+        elif kind == "open_folder":
+            phrases.append(f"opening the {target} folder")
+            i += 1
+        elif kind == "focus_app":
+            phrases.append(f"switching to {target}")
+            i += 1
+        elif kind == "close_app":
+            phrases.append(f"closing {target}" if target else "closing that")
+            i += 1
+        elif kind == "press_key" and target.lower() == "ctrl+l" and i + 1 < n \
+                and steps[i + 1].get("action") == "type_text":
+            url = str(steps[i + 1].get("target") or "").strip()
+            phrases.append(f"going to {url}")
+            i += 2
+            if i < n and steps[i].get("action") == "press_key" \
+                    and (steps[i].get("target") or "").lower() == "enter":
+                i += 1
+        elif kind == "type_text":
+            phrases.append(f"searching for {target}" if target else "typing that in")
+            i += 1
+            if i < n and steps[i].get("action") == "press_key" \
+                    and (steps[i].get("target") or "").lower() == "enter":
+                i += 1
+        elif kind == "click_text":
+            phrases.append(f"clicking {target}")
+            i += 1
+        elif kind == "scroll":
+            phrases.append(f"scrolling {target}")
+            i += 1
+        elif kind == "screenshot":
+            phrases.append("taking a screenshot")
+            i += 1
+        else:
+            i += 1  # wait, lone press_key, get_color etc. — not worth narrating
+
+    return phrases
+
+
+def _brief_sequence(steps) -> str:
+    """One short spoken line summarising a whole plan:
+    'Opening brave, then going to youtube.com.'"""
+    phrases = _brief_phrases(steps)
+    if not phrases:
+        return "Done."
+    text = ", then ".join(phrases)
+    return text[0].upper() + text[1:] + "."
+
+
+def _run_sequence(steps, _prefix=None, for_speech=False):
     """Execute a multi-step plan in order, one step at a time, and return a
     single aggregated reply string.
+
+    for_speech only changes the RETURNED text (a short spoken summary via
+    _brief_sequence), never what runs — every step still executes exactly as it
+    does in text mode.
 
     Each step goes through the ordinary single-action execute_action, so every
     step behaves exactly as it would as a standalone command. Two things make
@@ -626,33 +738,49 @@ def _run_sequence(steps, _prefix=None):
             # click so the pick can resume from there.
             disambiguation.arm(result, resume_steps=steps[i + 1:])
             prompt = disambiguation.prompt_for(result)
+            if for_speech:
+                # Speak a short "here's what I've done so far" before the pick
+                # prompt (which itself must stay verbose — it lists the options).
+                lead_bits = list(_prefix or [])
+                if i:
+                    lead_bits.append(_brief_sequence(steps[:i]))
+                lead = " ".join(b for b in lead_bits if b).strip()
+                return (lead + " " + prompt).strip() if lead else prompt
             if results:
                 return "Done so far: " + "; ".join(results) + ". " + prompt
             return prompt
 
         results.append(str(result))
 
+    if for_speech:
+        # Every step ran above; now speak the short natural summary instead of
+        # the per-step log. _prefix holds already-spoken lines from a resumed
+        # click, so keep those and append the tail's summary.
+        summary = _brief_sequence(steps)
+        return (" ".join(_prefix) + " " + summary).strip() if _prefix else summary
+
     return "; ".join(results)
 
 
-def _dispatch(action):
+def _dispatch(action, for_speech=False):
     """Run a resolved action and return a reply string, handling both shapes:
     a multi-step sequence (via _run_sequence) or a single action (via
     execute_action, arming the disambiguation gate if the click is ambiguous).
 
     For a single action this reproduces the old inline main-path behaviour
-    exactly, so nothing about single commands changes."""
+    exactly, so nothing about single commands changes. for_speech only swaps the
+    RETURNED text for a short spoken form (via _brief_single) — never what runs."""
     if is_sequence(action):
-        return _run_sequence(action["steps"])
+        return _run_sequence(action["steps"], for_speech=for_speech)
 
     result = execute_action(action)
     if isinstance(result, disambiguation.AmbiguousClick):
         disambiguation.arm(result)
         return disambiguation.prompt_for(result)
-    return result
+    return _brief_single(action, result) if for_speech else result
 
 
-def process_command(user_input: str, write_pet_state=None) -> str:
+def process_command(user_input: str, write_pet_state=None, for_speech: bool = False) -> str:
     """
     Run one command through the full pipeline (cache -> Qwen -> validate
     -> execute) and return a plain-text result string.
@@ -661,6 +789,11 @@ def process_command(user_input: str, write_pet_state=None) -> str:
     "idle") so callers can drive the pet UI's animation. Text mode and
     voice mode both call this — it's the one place the actual agent
     logic lives, so neither mode can drift out of sync with the other.
+
+    for_speech=True (voice mode) returns a short, natural spoken summary of
+    what ran instead of the detailed per-step string; it never changes which
+    actions execute, only the words that come back to be read aloud. Text mode
+    leaves it False and keeps the detailed reply.
     """
 
     def _pet(state):
@@ -690,7 +823,7 @@ def process_command(user_input: str, write_pet_state=None) -> str:
             if decision == "confirm":
                 action = confirmation.take()
                 print("⚙️ Executing (confirmed):", action)
-                result = _dispatch(action)
+                result = _dispatch(action, for_speech=for_speech)
                 _pet("idle")
                 return result + confirmation.recovery_hint(action)
             if decision == "cancel":
@@ -721,11 +854,14 @@ def process_command(user_input: str, write_pet_state=None) -> str:
                           "label": disambiguation.describe_choice(ambig, choice)}
                 print("⚙️ Executing (chosen):", action)
                 result = execute_action(action)
+                if for_speech:
+                    result = "Clicked that."
                 # "Ask & resume": if this click was one step of a sequence, carry
                 # on with the steps that came after it. _run_sequence re-arms this
                 # same gate if a later step is ambiguous too.
                 if resume_steps:
-                    result = _run_sequence(resume_steps, _prefix=[str(result)])
+                    result = _run_sequence(resume_steps, _prefix=[str(result)],
+                                           for_speech=for_speech)
                 _pet("idle")
                 return result
             if choice == "cancel":
@@ -813,7 +949,7 @@ def process_command(user_input: str, write_pet_state=None) -> str:
         # on an ambiguous click (a mid-sequence click also stashes its resume
         # tail), keeping this function's return type a plain string for every
         # caller.
-        result = _dispatch(action)
+        result = _dispatch(action, for_speech=for_speech)
 
         _pet("idle")
         return result
@@ -886,7 +1022,8 @@ def run_voice_mode():
         # "stop"/"forget it" here read as "cancel that" rather than "exit voice
         # mode" / "forget a cached prompt".
         if confirmation.is_pending() or disambiguation.is_pending():
-            return process_command(command_text, write_pet_state=_pet_state)
+            return process_command(command_text, write_pet_state=_pet_state,
+                                   for_speech=True)
 
         if command_text.lower().strip() in VOICE_EXIT_WORDS:
             # Voice mode doesn't have a clean way to break its own loop
@@ -897,7 +1034,8 @@ def run_voice_mode():
             forget_prompt(command_text[7:].strip())
             return "Forgotten."
 
-        return process_command(command_text, write_pet_state=_pet_state)
+        return process_command(command_text, write_pet_state=_pet_state,
+                               for_speech=True)
 
     voice_io.voice_loop(on_command)
 
