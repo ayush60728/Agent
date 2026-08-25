@@ -35,6 +35,7 @@ import os
 from app_resolver import find_app
 from folder_resolver import find_folder
 from desktop_actions import click_text as _click_text
+from desktop_actions import click_at as _click_at
 from desktop_actions import type_text as _type_text
 from desktop_actions import press_key as _press_key
 from desktop_actions import wait as _wait
@@ -163,9 +164,13 @@ def _ensure_focused_app_active() -> str | None:
     return None
 
 
-def click_text(target_text: str) -> str:
+def click_text(target_text: str):
     """Find text on screen (within the focused app's window) via OCR and
-    click its center point. Refuses if the focused app has been closed."""
+    click its center point. Refuses if the focused app has been closed.
+
+    Usually returns a result string, but may return an AmbiguousClick when 2+
+    rival matches remain — process_command consumes that to ask the user which
+    one; it never reaches an end caller as a value to print."""
 
     if not target_text:
         return "I need some text to click."
@@ -175,6 +180,24 @@ def click_text(target_text: str) -> str:
         return error
 
     return _click_text(target_text)
+
+
+def click_at(x, y, label: str = "that") -> str:
+    """Click an absolute screen coordinate the user chose during
+    disambiguation. Re-focuses the tracked app first: the pick arrives a turn
+    after the numbered prompt, by which point typing/speaking the choice has
+    likely pulled foreground focus back to this terminal, so we must bring the
+    target window forward again before clicking (same reason click_text does).
+
+    Internal only — not in ALLOWED_ACTIONS and never emitted by Qwen; the
+    disambiguation handler builds the click_at action directly from a stored
+    candidate, so validate_action is intentionally bypassed for it."""
+
+    error = _ensure_focused_app_active()
+    if error:
+        return error
+
+    return _click_at(x, y, label)
 
 
 def type_text(text: str) -> str:
@@ -279,6 +302,13 @@ def execute_action(action: dict) -> str:
 
     if action_type == "click_text":
         return click_text(action.get("target", ""))
+
+    if action_type == "click_at":
+        # Internal action: a disambiguated click on stored coordinates. Not
+        # user/LLM-facing (see click_at above) — constructed by the
+        # disambiguation handler in agent.process_command.
+        return click_at(action.get("x"), action.get("y"),
+                        action.get("label", "that"))
 
     if action_type == "type_text":
         return type_text(action.get("target", ""))

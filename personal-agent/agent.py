@@ -6,7 +6,9 @@ import ollama
 
 from actions import execute_action
 from builtin_commands import get_builtin_action
-from prompt_cache import get_cached_action, save_action, forget_prompt
+from prompt_cache import get_cached_action, save_action, forget_prompt, normalize_prompt
+import confirmation
+import disambiguation
 
 
 MODEL = "qwen3-nothink"  # custom model with /no_think baked into its
@@ -18,8 +20,10 @@ SYSTEM_PROMPT = """
 /no_think
 You are the reasoning core of a local Windows AI agent.
 
-Your job is to understand the user's request and convert it into
-ONE valid JSON action. Ignore greetings, filler words, and politeness
+Your job is to understand the user's request and convert it into a valid
+JSON action — a single action for a single request, or an ordered SEQUENCE of
+actions when the user asks for several things at once (see MULTI-STEP REQUESTS
+below). Ignore greetings, filler words, and politeness
 ("hey", "can you", "please", "for me") — focus only on the actual request.
 
 You do NOT directly control Windows.
@@ -183,6 +187,27 @@ using the special media keys. Map them like this:
 - volume down / quieter        -> press_key "volumedown"
 - mute / unmute                -> press_key "volumemute"
 
+MULTI-STEP REQUESTS: If the user asks for several actions in one sentence
+(e.g. "open brave, go to youtube and search for cats", "open notepad and type
+hello then save"), do NOT pick just one — output an ordered SEQUENCE instead of
+a single action:
+
+{
+    "steps": [
+        {"action": "...", "target": "..."},
+        {"action": "...", "target": "..."}
+    ]
+}
+
+Each step is one of the single actions listed above. Rules for good sequences:
+- List the steps in the order the user said them.
+- After open_app (launching a program), add {"action":"wait","target":2} before
+  you click/type/press inside it — the window needs a moment to appear.
+- To go to a website in a browser, focus the address bar first with
+  {"action":"press_key","target":"ctrl+l"}, then type_text the URL, then
+  press_key "enter".
+- If the request is really just ONE action, use the single-action form, NOT steps.
+
 Rules:
 - Return ONLY valid JSON.
 - Do NOT return Markdown.
@@ -342,6 +367,14 @@ Output:
 User: click the X to close it
 Output:
 {"action":"close_app","target":""}
+
+User: open notepad and type hello world then save
+Output:
+{"steps":[{"action":"open_app","target":"notepad"},{"action":"wait","target":2},{"action":"type_text","target":"hello world"},{"action":"press_key","target":"ctrl+s"}]}
+
+User: open brave, go to youtube and search for cat videos
+Output:
+{"steps":[{"action":"open_app","target":"brave"},{"action":"wait","target":2},{"action":"press_key","target":"ctrl+l"},{"action":"type_text","target":"youtube.com"},{"action":"press_key","target":"enter"},{"action":"wait","target":2},{"action":"type_text","target":"cat videos"},{"action":"press_key","target":"enter"}]}
 """
 
 
@@ -358,6 +391,51 @@ ALLOWED_ACTIONS = {
     "get_color",
     "wait",
 }
+
+
+# Upper bound on how many steps a single multi-step request may expand into.
+# A guard against a runaway plan (a confused model emitting dozens of steps),
+# not a limit anyone should hit in normal use — real chained commands are a
+# handful of steps.
+MAX_STEPS = 12
+
+
+def normalize_action(parsed):
+    """Canonicalize whatever a source (LLM / cache / builtin) produced into one
+    of two shapes: a single-action dict, or a composite sequence
+    {"action": "sequence", "steps": [ ...actions... ]}.
+
+    Accepts the several forms the model might emit for a multi-step plan and
+    folds them together so the rest of the pipeline only ever sees those two
+    shapes:
+        {"steps": [A, B, ...]}   ->  {"action":"sequence","steps":[A, B, ...]}
+        [A, B, ...]              ->  {"action":"sequence","steps":[A, B, ...]}
+        {"steps": [A]} / [A]     ->  A          (a one-item plan is just A)
+        A single action dict     ->  A          (unchanged — the common case)
+
+    Unwrapping a one-item plan is deliberate: it keeps a trivial "sequence" from
+    taking the multi-step execution path, so single-action behaviour is
+    byte-for-byte what it was before this feature. Idempotent — a value already
+    in canonical form is returned unchanged."""
+    # {"steps": [...]} wrapper -> the list inside it.
+    if isinstance(parsed, dict) and "steps" in parsed and "action" not in parsed:
+        parsed = parsed.get("steps")
+
+    if isinstance(parsed, list):
+        steps = parsed
+        if len(steps) == 1:
+            return steps[0]                       # one-item plan == that action
+        return {"action": "sequence", "steps": steps}
+
+    # Already a single action dict (or an already-normalized sequence, or
+    # something malformed that validate_action will reject) — leave as-is.
+    return parsed
+
+
+def is_sequence(action) -> bool:
+    """True if this action is a multi-step sequence (executed step-by-step by
+    _run_sequence, never handed to execute_action as a whole)."""
+    return isinstance(action, dict) and action.get("action") == "sequence"
 
 
 def ask_qwen(user_input):
@@ -384,7 +462,11 @@ def ask_qwen(user_input):
                            # unloads an idle model after ~5 minutes.
         options={
             "temperature": 0,   # deterministic — we want consistent JSON, not creativity
-            "num_predict": 80,  # small headroom above the old 60; format=json adds a little overhead
+            "num_predict": 512,  # room for a multi-step {"steps":[...]} plan. A single
+                                 # action still stops early (format="json" ends at the
+                                 # closing brace), so this doesn't slow the common case;
+                                 # it only stops multi-step output from being truncated
+                                 # mid-plan (which would fail JSON parsing). Was 80.
             "num_ctx": 4096,    # Cap the context window. qwen3 otherwise defaults to a huge
                                 # (~128K) window, and Ollama pre-allocates a KV cache for the
                                 # full size at load — ~35 GB, which OOMs and the model never
@@ -424,6 +506,30 @@ def validate_action(action):
         return False, "Action must be a JSON object."
 
     action_type = action.get("action")
+
+    # A multi-step sequence: validate the wrapper here (length + each step),
+    # BEFORE the single-action ALLOWED_ACTIONS check below — "sequence" is
+    # deliberately NOT in ALLOWED_ACTIONS, so a step that is itself a "sequence"
+    # is rejected by the recursive call (no nesting).
+    if action_type == "sequence":
+        steps = action.get("steps")
+        if not isinstance(steps, list):
+            return False, "A sequence needs a list of steps."
+        if len(steps) < 2:
+            # A 0/1-step "sequence" shouldn't exist post-normalization; if one
+            # slips through, it's malformed rather than a real multi-step plan.
+            return False, "A sequence needs at least two steps."
+        if len(steps) > MAX_STEPS:
+            return False, f"Too many steps ({len(steps)}); the limit is {MAX_STEPS}."
+        for i, step in enumerate(steps, 1):
+            if not isinstance(step, dict):
+                return False, f"Step {i} must be an action object."
+            if step.get("action") == "sequence":
+                return False, "A sequence can't contain another sequence."
+            ok, err = validate_action(step)
+            if not ok:
+                return False, f"Step {i} ({step.get('action')}): {err}"
+        return True, None
 
     if action_type not in ALLOWED_ACTIONS:
         return False, f"Action '{action_type}' is not allowed."
@@ -488,6 +594,64 @@ EXIT_WORDS = {"exit", "quit", "stop", "bye"}
 VOICE_EXIT_WORDS = {"exit", "quit", "bye", "goodbye"}
 
 
+def _run_sequence(steps, _prefix=None):
+    """Execute a multi-step plan in order, one step at a time, and return a
+    single aggregated reply string.
+
+    Each step goes through the ordinary single-action execute_action, so every
+    step behaves exactly as it would as a standalone command. Two things make
+    this more than a for-loop:
+
+      * Ambiguous click ("ask & resume"): if a click step finds 2+ rival matches
+        it comes back as an AmbiguousClick. We arm the disambiguation gate with
+        the REMAINING steps as its resume tail and return the numbered prompt.
+        The user's pick (handled at the top of process_command) clicks the chosen
+        match and then calls _run_sequence again on that tail — so the rest of the
+        plan continues after the pick, and a later ambiguous click simply re-arms.
+
+      * _prefix carries the result lines of steps that already ran in an earlier
+        turn (e.g. the resolved click), so the resumed reply reads as one whole.
+
+    Destructive steps are NOT re-confirmed here: a sequence containing any
+    destructive step is confirmed as a whole batch up front (see
+    process_command), so by the time we run the steps the user has already said
+    yes to all of them."""
+    results = list(_prefix or [])
+    for i, step in enumerate(steps):
+        print("⚙️ Executing (step):", step)
+        result = execute_action(step)
+
+        if isinstance(result, disambiguation.AmbiguousClick):
+            # Suspend the plan: ask which match, and stash everything AFTER this
+            # click so the pick can resume from there.
+            disambiguation.arm(result, resume_steps=steps[i + 1:])
+            prompt = disambiguation.prompt_for(result)
+            if results:
+                return "Done so far: " + "; ".join(results) + ". " + prompt
+            return prompt
+
+        results.append(str(result))
+
+    return "; ".join(results)
+
+
+def _dispatch(action):
+    """Run a resolved action and return a reply string, handling both shapes:
+    a multi-step sequence (via _run_sequence) or a single action (via
+    execute_action, arming the disambiguation gate if the click is ambiguous).
+
+    For a single action this reproduces the old inline main-path behaviour
+    exactly, so nothing about single commands changes."""
+    if is_sequence(action):
+        return _run_sequence(action["steps"])
+
+    result = execute_action(action)
+    if isinstance(result, disambiguation.AmbiguousClick):
+        disambiguation.arm(result)
+        return disambiguation.prompt_for(result)
+    return result
+
+
 def process_command(user_input: str, write_pet_state=None) -> str:
     """
     Run one command through the full pipeline (cache -> Qwen -> validate
@@ -505,6 +669,72 @@ def process_command(user_input: str, write_pet_state=None) -> str:
 
     try:
         _pet("thinking")
+
+        # Ignore blank / punctuation-only input before anything else. A bare
+        # wake word transcribed as "agent." leaves just ".", which normalizes
+        # to the empty string — never run that through builtins, the cache, or
+        # Qwen (an empty prompt sent to Qwen is how a bogus "" -> open brave
+        # cache entry got born in the first place). Any pending confirmation or
+        # disambiguation stays armed: an empty utterance is neither a yes/no
+        # nor a pick, so we simply don't consume it.
+        if not normalize_prompt(user_input):
+            _pet("idle")
+            return "I didn't catch that."
+
+        # 0. If a destructive action is armed and waiting for confirmation,
+        #    THIS input is the yes/no answer — interpret it here, before the
+        #    classifier ever sees it (so "yes"/"no" never get sent to Qwen or
+        #    saved to the prompt cache as if they were commands).
+        if confirmation.is_pending():
+            decision = confirmation.interpret(user_input)
+            if decision == "confirm":
+                action = confirmation.take()
+                print("⚙️ Executing (confirmed):", action)
+                result = _dispatch(action)
+                _pet("idle")
+                return result + confirmation.recovery_hint(action)
+            if decision == "cancel":
+                action = confirmation.pending_action()
+                confirmation.clear()
+                _pet("idle")
+                return (f"Okay, I won't {confirmation.describe(action)}."
+                        if action else "Okay, cancelled.")
+            # "unrelated": the user said something that isn't a yes/no — drop
+            # the stale pending action (better than holding a loaded close) and
+            # fall through to handle this input as a brand-new command.
+            confirmation.clear()
+
+        # 0b. If a click is awaiting disambiguation, THIS input is the pick (a
+        #     number / position / color). Resolve it here, before the classifier,
+        #     so a selection word like "two" or "top" can never collide with a
+        #     builtin command or be sent to Qwen.
+        if disambiguation.is_pending():
+            ambig = disambiguation.pending()
+            choice = disambiguation.interpret(user_input, ambig.candidates)
+            if isinstance(choice, int):
+                cand = ambig.candidates[choice]
+                # Read the sequence tail (if this click was mid-sequence) BEFORE
+                # clearing — clear() drops it.
+                resume_steps = disambiguation.pending_resume_steps()
+                disambiguation.clear()
+                action = {"action": "click_at", "x": cand["x"], "y": cand["y"],
+                          "label": disambiguation.describe_choice(ambig, choice)}
+                print("⚙️ Executing (chosen):", action)
+                result = execute_action(action)
+                # "Ask & resume": if this click was one step of a sequence, carry
+                # on with the steps that came after it. _run_sequence re-arms this
+                # same gate if a later step is ambiguous too.
+                if resume_steps:
+                    result = _run_sequence(resume_steps, _prefix=[str(result)])
+                _pet("idle")
+                return result
+            if choice == "cancel":
+                disambiguation.clear()
+                _pet("idle")
+                return "Okay, cancelled."
+            # "unrelated": not a pick — drop the pending selection and treat
+            # this input as a brand-new command (fall through).
+            disambiguation.clear()
 
         # 1. Curated builtins first — instant and deterministic (no LLM, no
         #    cache-file read). Covers the hottest commands: scroll, volume,
@@ -528,17 +758,29 @@ def process_command(user_input: str, write_pet_state=None) -> str:
             print("Qwen:", raw_response)
 
             # Defensive cleanup: strip <think> blocks / markdown fences,
-            # then pull out just the {...} object — belt-and-suspenders
-            # in case any reasoning prose sneaks in around the JSON
-            # despite format="json".
+            # then pull out just the JSON value — belt-and-suspenders in case
+            # any reasoning prose sneaks in around it despite format="json".
             cleaned = re.sub(r"<think>.*?</think>", "", raw_response, flags=re.DOTALL)
             cleaned = cleaned.replace("```json", "").replace("```", "").strip()
 
-            json_match = re.search(r"\{.*\}", cleaned, flags=re.DOTALL)
+            # It's normally a single {...} object, but a multi-step plan can
+            # arrive as a top-level [...] array — branch on the leading char. A
+            # greedy \{.*\} would otherwise swallow an array's inner objects and
+            # drop the surrounding brackets, yielding invalid JSON.
+            if cleaned.startswith("["):
+                json_match = re.search(r"\[.*\]", cleaned, flags=re.DOTALL)
+            else:
+                json_match = re.search(r"\{.*\}", cleaned, flags=re.DOTALL)
             if not json_match:
-                raise json.JSONDecodeError("No JSON object found", cleaned, 0)
+                raise json.JSONDecodeError("No JSON value found", cleaned, 0)
 
             action = json.loads(json_match.group(0))
+
+        # Fold whatever the source produced (single dict, {"steps":[...]}, or a
+        # bare [...] list) into our two canonical shapes: a single action, or a
+        # {"action":"sequence","steps":[...]} composite. Idempotent, so a cached
+        # sequence or a builtin single action passes straight through.
+        action = normalize_action(action)
 
         valid, error = validate_action(action)
 
@@ -553,9 +795,26 @@ def process_command(user_input: str, write_pet_state=None) -> str:
         if not from_builtin and not was_cached:
             save_action(user_input, action)
 
+        # 4. Destructive actions (close a window/tab/app) don't run on the
+        #    spot — a misheard command could kill an app in under a second.
+        #    Arm it here and ask for a yes/no; the NEXT command resolves it
+        #    (see the pending-confirmation check at the top of this function).
+        #    Gating here — after every source has produced its action —
+        #    covers builtins, cache hits, and the LLM alike.
+        if confirmation.needs_confirmation(action):
+            confirmation.arm(action)
+            _pet("idle")
+            return confirmation.prompt_for(action)
+
         print("⚙️ Executing:", action)
 
-        result = execute_action(action)
+        # Dispatch through the runner: a single action executes exactly as
+        # before; a sequence runs step-by-step. Both arm the disambiguation gate
+        # on an ambiguous click (a mid-sequence click also stashes its resume
+        # tail), keeping this function's return type a plain string for every
+        # caller.
+        result = _dispatch(action)
+
         _pet("idle")
         return result
 
@@ -584,7 +843,12 @@ def run_text_mode():
 
         # Control commands bypass the LLM entirely — there's no reason to
         # send "quit" to Qwen and wait for a JSON classification of it.
-        if user_input.lower() in EXIT_WORDS:
+        # ...but not while a destructive action is awaiting yes/no, or a click
+        # is awaiting a pick: there, "stop" means "cancel that", not "exit the
+        # agent", so let it through to process_command's handlers.
+        if (user_input.lower() in EXIT_WORDS
+                and not confirmation.is_pending()
+                and not disambiguation.is_pending()):
             print("Agent stopped.")
             break
 
@@ -616,6 +880,14 @@ def run_voice_mode():
         voice_io._write_state(state)
 
     def on_command(command_text: str) -> str:
+        # If a destructive action is armed (yes/no) or a click is awaiting a
+        # pick, this utterance is the answer — route it straight to the
+        # pipeline's handlers, ahead of the exit/forget shortcuts, so
+        # "stop"/"forget it" here read as "cancel that" rather than "exit voice
+        # mode" / "forget a cached prompt".
+        if confirmation.is_pending() or disambiguation.is_pending():
+            return process_command(command_text, write_pet_state=_pet_state)
+
         if command_text.lower().strip() in VOICE_EXIT_WORDS:
             # Voice mode doesn't have a clean way to break its own loop
             # from in here; just let it keep listening but say goodbye.
@@ -628,6 +900,30 @@ def run_voice_mode():
         return process_command(command_text, write_pet_state=_pet_state)
 
     voice_io.voice_loop(on_command)
+
+
+def _launch_video_pet():
+    """Start the looping corner video pet (video_pet.py) as a background
+    process. Best-effort: the agent must still run if this fails (missing file,
+    no display, PyAV not installed, ...). Uses pythonw.exe when available so the
+    pet doesn't spawn its own console window."""
+    import os
+    import subprocess
+
+    base = os.path.dirname(os.path.abspath(__file__))
+    script = os.path.join(base, "video_pet.py")
+    if not os.path.exists(script):
+        return
+    exe = sys.executable
+    pyw = os.path.join(os.path.dirname(exe), "pythonw.exe")
+    if os.path.exists(pyw):
+        exe = pyw
+    try:
+        # Pass our pid so the (now non-interactive, un-closeable) pet exits when
+        # the agent does.
+        subprocess.Popen([exe, script, "--parent-pid", str(os.getpid())], cwd=base)
+    except OSError:
+        pass
 
 
 def main():
@@ -669,6 +965,10 @@ def main():
         import voice_io
         voice_io.print_input_devices()
         return
+
+    # Kick off the looping corner video pet as soon as the agent starts (its
+    # audio plays once; the visuals loop). Best-effort — never blocks the agent.
+    _launch_video_pet()
 
     if args.voice:
         if args.mic is not None:
