@@ -19,13 +19,18 @@ Transparency:
     are preserved instead of being punched into holes. The background pixels are
     painted magenta and the window keys magenta out via -transparentcolor.
 
-Behaviour the user asked for:
-    * VERY small, pinned to the bottom-right corner.       (see TARGET_H)
-    * NOT clickable and NOT movable — the window is click-through (mouse events
-      pass straight to whatever is behind it), so it can't be dragged, focused,
-      or clicked. There is therefore no way to close it by hand, so instead its
-      lifetime is tied to the agent: pass --parent-pid <agent pid> and the pet
-      exits automatically when the agent process exits.
+Behaviour:
+    * Small, pinned to the bottom-right corner.            (see TARGET_H)
+    * Resizable. Right-click the pet for size presets (Small/Medium/Large) or
+      hold Ctrl and left-drag it to scale freely; width always follows the
+      video's aspect ratio and the window keeps its bottom-right anchor,
+      growing toward the top-left. The chosen size is remembered across runs
+      in pet_config.json. (This is why the window is interactive rather than
+      click-through, as it originally was — catching those resize gestures is
+      the whole point.)
+    * NOT movable and has no close button. Its lifetime is tied to the agent:
+      pass --parent-pid <agent pid> and the pet exits automatically when the
+      agent process exits.
 
 Audio: the clip's sound plays ONCE at startup (via winsound, from the
 pre-extracted pet_video_audio.wav), then the visual just keeps looping silently.
@@ -76,12 +81,27 @@ BRIGHT_HI = 246              # brightest to key (< 255 keeps white highlights)
 
 POLL_PARENT_MS = 800         # how often to check the agent is still alive
 
+# Resizing. The pet started out strictly click-through (mouse passed straight
+# through). To let users resize it we make it interactive instead: right-click
+# for the size presets below, or Ctrl+left-drag to scale freely. Height is the
+# size knob; width always follows the video's aspect ratio so the cat never
+# distorts. The window stays pinned to the bottom-right corner and grows toward
+# the top-left. The picked height is remembered in CONFIG across runs.
+MIN_H = 60                   # smallest allowed height (px)
+MAX_H = 200                  # largest allowed height (px). Kept modest on
+                             # purpose: the per-frame background flood-fill
+                             # (_border_connected_bg) costs grow with the pixel
+                             # area, so a huge pet would animate sluggishly.
+SIZE_PRESETS = (("Small", 70), ("Medium", 100), ("Large", 150))
+CONFIG = os.path.join(BASE_DIR, "pet_config.json")
+
 
 def ensure_audio():
     """Make sure pet_video_audio.wav exists; extract it from the video if not.
-    Best-effort — returns True if the WAV is available to play. (The launcher
-    deletes a stale WAV when the video changes, so this re-derives it from the
-    current video.)"""
+    Best-effort — returns True if the WAV is available to play. NOTE: a stale
+    WAV is NOT auto-purged (nothing in agent.py does this), so whoever swaps
+    pet_video.mp4 must delete the old pet_video_audio.wav by hand for the audio
+    to re-derive from the new clip."""
     if os.path.exists(AUDIO):
         return True
     try:
@@ -159,6 +179,8 @@ class VideoPet:
         self.root.overrideredirect(True)          # borderless, no taskbar entry
         self.root.attributes("-topmost", True)    # always on top
         self.root.attributes("-transparentcolor", KEY)
+        self.root.configure(bg=KEY)               # erase-to-key so a forced
+                                                  # repaint clears to transparent
 
         # Open the video and work out the display size from its aspect ratio.
         self.container = av.open(VIDEO)
@@ -166,54 +188,138 @@ class VideoPet:
         self.stream.thread_type = "AUTO"
         vw = self.stream.codec_context.width
         vh = self.stream.codec_context.height
-        self.h = TARGET_H
-        self.w = max(1, round(vw * (TARGET_H / vh)))
+        self._aspect = vw / vh                     # width = round(height * aspect)
+        self.h = self._load_size()                 # persisted size, or TARGET_H
+        self.w = self._width_for(self.h)
+        self._resizing = False                     # mid Ctrl-drag?
+        self._last_frame = None                    # last decoded frame, for
+                                                   # crisp re-render on resize
 
         rate = self.stream.average_rate or 24
         self.delay = max(1, round(1000 / float(rate)))
         self._gen = self._frames()
         self.photo = None
 
-        sw = self.root.winfo_screenwidth()
-        sh = self.root.winfo_screenheight()
-        x = sw - self.w - MARGIN_X
-        y = sh - self.h - MARGIN_Y
-        self.root.geometry(f"{self.w}x{self.h}+{x}+{y}")
+        self._apply_geometry()
 
         self.label = tk.Label(self.root, borderwidth=0, highlightthickness=0,
                               bg=KEY)
-        self.label.pack()
+        self.label.pack(fill="both", expand=True)
 
-        # No drag / click bindings on purpose: the pet is non-interactive.
-        # On Windows we also make the whole window click-through below.
+        # The pet is interactive so it can be resized: right-click for size
+        # presets, Ctrl+left-drag to scale freely. It is deliberately NOT
+        # click-through (that would swallow these gestures). It still can't be
+        # moved and has no close button; its lifetime is tied to the agent pid.
         self.root.update_idletasks()
-        self._make_click_through()
+        self._build_menu()
+        self._bind_interactions()
         self._open_parent_handle()
 
         self._play_audio_once()
         self._tick()
         self._watch_parent()
 
-    # -- windows: click-through + parent-liveness ----------------------
+    # -- resizing / interaction ----------------------------------------
 
-    def _make_click_through(self):
-        """Set WS_EX_LAYERED | WS_EX_TRANSPARENT so mouse events pass straight
-        through the window — it can't be clicked, dragged, or focused. Best
-        effort: if it fails the pet still runs, just interactive."""
-        if not IS_WIN:
-            return
+    def _width_for(self, h):
+        """Width that keeps the video's aspect ratio at height h."""
+        return max(1, round(h * self._aspect))
+
+    def _apply_geometry(self):
+        """Pin the window (at its current w/h) to the bottom-right corner, so
+        it grows toward the top-left as it gets bigger."""
+        sw = self.root.winfo_screenwidth()
+        sh = self.root.winfo_screenheight()
+        x = sw - self.w - MARGIN_X
+        y = sh - self.h - MARGIN_Y
+        self.root.geometry(f"{self.w}x{self.h}+{x}+{y}")
+
+    def _build_menu(self):
+        """Right-click context menu of size presets. Radiobuttons show a check
+        next to the preset matching the current height (freeform sizes match
+        none)."""
+        self._size_var = tk.IntVar(value=self.h)
+        self.menu = tk.Menu(self.root, tearoff=0)
+        for name, h in SIZE_PRESETS:
+            self.menu.add_radiobutton(
+                label=f"{name}  ({h}px)", value=h, variable=self._size_var,
+                command=lambda h=h: self._set_size(h))
+
+    def _bind_interactions(self):
+        """Bind the resize gestures on the visible label — it fills the window,
+        so it (not the root) is what the cursor is actually over."""
+        self.label.bind("<Button-3>", self._popup_menu)          # right-click
+        self.label.bind("<Control-Button-1>", self._on_resize_start)
+        self.label.bind("<Control-B1-Motion>", self._on_resize_drag)
+        self.label.bind("<ButtonRelease-1>", self._on_resize_end)
+
+    def _popup_menu(self, event):
         try:
-            import ctypes
-            user32 = ctypes.windll.user32
-            hwnd = user32.GetParent(self.root.winfo_id()) or self.root.winfo_id()
-            GWL_EXSTYLE = -20
-            WS_EX_LAYERED = 0x00080000
-            WS_EX_TRANSPARENT = 0x00000020
-            cur = user32.GetWindowLongW(hwnd, GWL_EXSTYLE)
-            user32.SetWindowLongW(hwnd, GWL_EXSTYLE,
-                                  cur | WS_EX_LAYERED | WS_EX_TRANSPARENT)
-        except Exception:
+            self.menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            self.menu.grab_release()
+
+    def _set_size(self, h, save=True, render=True):
+        """Resize to height h px (clamped to [MIN_H, MAX_H]), width following
+        the aspect ratio, keeping the bottom-right anchor. render re-paints the
+        last frame at once (crisp preset snaps); the frame tick would otherwise
+        catch up within ~one frame anyway."""
+        self.h = int(max(MIN_H, min(MAX_H, round(h))))
+        self.w = self._width_for(self.h)
+        self._size_var.set(self.h)
+        self._apply_geometry()
+        if render and self._last_frame is not None:
+            self._render(self._last_frame)
+        if save:
+            self._save_size()
+
+    def _on_resize_start(self, event):
+        self._resizing = True
+        self._drag_start_y = event.y_root
+        self._drag_start_h = self.h
+
+    def _on_resize_drag(self, event):
+        if not self._resizing:
+            return
+        # The window is anchored bottom-right and expands up-left, so dragging
+        # the cursor up grows the pet and dragging down shrinks it. Skip the
+        # per-motion re-render (render=False) to avoid firing the O(area) key
+        # flood-fill on every mouse move; the frame tick keeps it looking live.
+        delta = self._drag_start_y - event.y_root
+        self._set_size(self._drag_start_h + delta, save=False, render=False)
+
+    def _on_resize_end(self, event):
+        if not self._resizing:
+            return
+        self._resizing = False
+        if self._last_frame is not None:
+            self._render(self._last_frame)     # crisp final frame
+        self._save_size()
+
+    def _load_size(self):
+        """Return the persisted pet height if one was saved and is in range,
+        else the TARGET_H default. Best-effort."""
+        try:
+            import json
+            with open(CONFIG, encoding="utf-8") as f:
+                h = int(json.load(f).get("height", TARGET_H))
+            if MIN_H <= h <= MAX_H:
+                return h
+        except (OSError, ValueError, TypeError):
             pass
+        return TARGET_H
+
+    def _save_size(self):
+        """Persist the current height so the size survives restarts.
+        Best-effort — a failure here must never take the pet down."""
+        try:
+            import json
+            with open(CONFIG, "w", encoding="utf-8") as f:
+                json.dump({"height": self.h}, f)
+        except OSError:
+            pass
+
+    # -- windows: parent-liveness --------------------------------------
 
     def _open_parent_handle(self):
         """Open a handle to the agent process so we can detect when it exits.
@@ -298,10 +404,41 @@ class VideoPet:
         except StopIteration:
             self._quit()
             return
+        self._last_frame = frame
+        self._render(frame)
+        self.root.after(self.delay, self._tick)
+
+    def _render(self, frame):
+        """Reformat frame to the current w/h, key out the background, and show
+        it. Called by the frame tick and again on resize so the pet re-renders
+        at the new size immediately."""
         rgb = frame.reformat(width=self.w, height=self.h, format="rgb24").to_image()
         self.photo = ImageTk.PhotoImage(self._key(rgb))
         self.label.config(image=self.photo)
-        self.root.after(self.delay, self._tick)
+        self._force_repaint()
+
+    def _force_repaint(self):
+        """Force a full erase+repaint of the window each frame. Windows'
+        color-key transparency (-transparentcolor) can otherwise leave 'ghost'
+        trails of moving content (e.g. the typing text) because stale pixels
+        linger in the keyed layer instead of being cleared; invalidating +
+        erasing the whole window (to the key colour, i.e. transparent) forces
+        those pixels to be repainted every frame. Best-effort, Windows-only."""
+        if not IS_WIN:
+            return
+        try:
+            import ctypes
+            user32 = ctypes.windll.user32
+            hwnd = user32.GetParent(self.root.winfo_id()) or self.root.winfo_id()
+            RDW_INVALIDATE = 0x0001
+            RDW_ERASE = 0x0004
+            RDW_ALLCHILDREN = 0x0080
+            RDW_UPDATENOW = 0x0100
+            user32.RedrawWindow(hwnd, None, None,
+                                RDW_INVALIDATE | RDW_ERASE
+                                | RDW_ALLCHILDREN | RDW_UPDATENOW)
+        except Exception:
+            pass
 
     def _quit(self):
         self._closed = True

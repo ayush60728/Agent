@@ -426,7 +426,16 @@ def voice_loop(on_command):
     is expected to return a string reply, which gets spoken back via TTS.
     """
     recognizer = sr.Recognizer()
-    recognizer.pause_threshold = 0.8  # shorter pause = snappier phrase-end detection
+    # How much trailing silence ends a phrase. This is a direct tax on every
+    # command's tail: listen() waits this long after you stop talking before it
+    # hands the audio to Whisper, so it's the biggest tunable chunk of perceived
+    # wake-word latency (the idle energy gate and Whisper's own vad_filter=True
+    # already keep silence/noise from ever reaching the expensive transcribe
+    # pass — measured ~50-80ms to reject non-speech). 0.5s shaves ~0.3s off each
+    # turn versus sr's 0.8 default while still tolerating the brief mid-sentence
+    # pause in a short command ("agent... open brave"). Lower risks cutting you
+    # off mid-phrase; raise it back toward 0.8 if commands get chopped.
+    recognizer.pause_threshold = 0.5
 
     # Braille spinner so the terminal visibly "breathes" while idle-listening —
     # otherwise a working-but-quiet mic looks identical to a frozen program.
@@ -498,6 +507,64 @@ def voice_loop(on_command):
         # changes regularly.
         with mic as source:
             while True:
+                # If a destructive action is awaiting a yes/no, or an ambiguous
+                # click is awaiting a pick, the user's NEXT words ARE the answer
+                # — capture them directly, WITHOUT requiring the wake word. A
+                # bare "yes"/"no"/"two"/"the red one" has no wake word and no
+                # command-start verb, so without this it gets dropped at the
+                # wake-word gate below and the question can never be answered by
+                # voice: the agent asks, then looks like it ignored you. (You'd
+                # have had to say "agent yes", which nobody knows to do.)
+                if confirmation.is_pending() or disambiguation.is_pending():
+                    _write_state("listening")
+                    waiting_for = "yes or no" if confirmation.is_pending() else "your pick"
+                    try:
+                        answer = _listen_on_source(
+                            recognizer, source, phrase_time_limit=6,
+                            timeout=WAKE_LISTEN_TIMEOUT,
+                        )
+                    except OSError as e:
+                        print(f"\n(microphone stream error: {e} — reconnecting…)")
+                        need_reopen = True
+                        break
+                    except Exception as e:
+                        # A transcription/driver hiccup while waiting for the
+                        # answer must not crash the session — skip this listen.
+                        print(f"\n(voice error hearing answer: {type(e).__name__}: {e})")
+                        _drain(source)
+                        continue
+
+                    if not answer:
+                        # Silence/noise — animate in place and keep waiting. If
+                        # the user never answers, the gate auto-expires on its
+                        # own timeout and we fall back to normal listening.
+                        print(
+                            f"\r  {next(spinner)} listening for {waiting_for}…        ",
+                            end="", flush=True,
+                        )
+                        continue
+
+                    answer = answer.lower().strip()
+                    # Tolerate a habitual "agent yes" / "okay agent, two": strip a
+                    # leading wake word so the bare answer still reaches the gate.
+                    stripped = re.sub(
+                        r"^(?:hey\s+|okay\s+|ok\s+)?(?:agent|asian|ancient|urgent)"
+                        r"\b[\s,.:;!?-]*",
+                        "", answer,
+                    ).strip()
+                    if stripped:
+                        answer = stripped
+
+                    print(f"\r(heard: '{answer}')                    ")
+                    log_utterance(answer, kind="command")
+
+                    _write_state("thinking")
+                    reply = on_command(answer)
+                    if reply:
+                        speak(reply)
+                    _drain(source)
+                    continue
+
                 _write_state("idle")
 
                 try:
