@@ -23,6 +23,8 @@ Anything with extra words ("please scroll down for me") falls through to the
 LLM, which strips filler and then caches the result for next time.
 """
 
+import re
+
 from prompt_cache import normalize_prompt
 
 
@@ -66,6 +68,9 @@ _COMMANDS = [
     (["new window"], {"action": "press_key", "target": "ctrl+n"}),
     (["switch window", "switch windows", "alt tab", "next window"],
      {"action": "press_key", "target": "alt+tab"}),
+    (["switch app", "switch apps", "switch tab", "switch tabs",
+      "three finger gesture", "show open apps", "task view"],
+     {"action": "switch_app_picker", "target": ""}),
     (["address bar", "focus address bar", "focus the address bar", "url bar"],
      {"action": "press_key", "target": "ctrl+l"}),
     (["zoom in"], {"action": "press_key", "target": "ctrl+="}),
@@ -130,3 +135,114 @@ def get_builtin_action(prompt: str):
     caller mutating the result can't corrupt the shared table."""
     action = BUILTINS.get(normalize_prompt(prompt))
     return dict(action) if action is not None else None
+
+
+_SPOTIFY_FILLER = re.compile(
+    r"\b(?:song|music|track|for me|please|on spotify|in spotify)\b",
+    re.IGNORECASE,
+)
+
+
+def _spotify_search_steps(query: str, *, open_first: bool = False) -> dict:
+    """Build a Spotify search/play plan that avoids OCR.
+
+    Spotify's visible Search button/text can be hard for OCR to distinguish,
+    but Ctrl+L focuses Spotify search reliably on the desktop app. Enter runs
+    the search, and the second Enter starts the highlighted/top result.
+    """
+    steps = []
+    if open_first:
+        steps.extend([
+            {"action": "open_app", "target": "spotify"},
+            {"action": "wait", "target": 2},
+        ])
+    else:
+        steps.append({"action": "focus_app", "target": "spotify"})
+
+    steps.extend([
+        {"action": "press_key", "target": "ctrl+l"},
+        {"action": "type_text", "target": query},
+        {"action": "press_key", "target": "enter"},
+        {"action": "wait", "target": 1},
+        {"action": "press_key", "target": "enter"},
+    ])
+    return {"action": "sequence", "steps": steps}
+
+
+def _clean_spotify_query(text: str) -> str:
+    text = _SPOTIFY_FILLER.sub(" ", text)
+    text = re.sub(r"\s+", " ", text)
+    return text.strip(" .,!?;:\"'()[]")
+
+
+def _current_focus_is_spotify() -> bool:
+    try:
+        from desktop_actions import get_current_focus_app
+    except Exception:
+        return False
+
+    current = get_current_focus_app()
+    return bool(current and "spotify" in current.lower())
+
+
+def get_smart_builtin_action(prompt: str):
+    """Dynamic deterministic commands that need a tiny bit of parsing.
+
+    These sit between exact builtins and the LLM. They cover hot voice intents
+    where the model has been unreliable, especially Spotify search/play.
+    """
+    norm = normalize_prompt(prompt)
+    if not norm:
+        return None
+
+    # "open spotify and play/search <song>" should stay inside Spotify after
+    # launch and immediately start the requested result.
+    m = re.match(
+        r"^(?:open|launch|start)\s+spotify(?:\s+and)?\s+"
+        r"(?:play|search(?:\s+for)?)\s+(.+)$",
+        norm,
+    )
+    if m:
+        query = _clean_spotify_query(m.group(1))
+        if query:
+            return _spotify_search_steps(query, open_first=True)
+
+    # Plain "open spotify and play" means open/focus it and toggle playback.
+    if re.match(r"^(?:open|launch|start)\s+spotify(?:\s+and)?\s+play$", norm):
+        return {"action": "sequence", "steps": [
+            {"action": "open_app", "target": "spotify"},
+            {"action": "wait", "target": 2},
+            {"action": "press_key", "target": "playpause"},
+        ]}
+
+    # Once Spotify is the tracked app, "search/play <song>" should not invent
+    # an unknown "search" action. Route it to Spotify's keyboard search.
+    m = re.match(r"^(?:spotify\s+)?(?:play|search(?:\s+for)?)\s+(.+)$", norm)
+    if m and (norm.startswith("spotify ") or _current_focus_is_spotify()):
+        query = _clean_spotify_query(m.group(1))
+        if query:
+            return _spotify_search_steps(query)
+
+    # "search" alone in Spotify focuses the search field without OCR.
+    if norm in {"spotify search", "search spotify", "search in spotify"}:
+        return {"action": "sequence", "steps": [
+            {"action": "focus_app", "target": "spotify"},
+            {"action": "press_key", "target": "ctrl+l"},
+        ]}
+
+    if norm in {
+        "click search",
+        "click on search",
+        "click the search",
+        "click search bar",
+        "click on search bar",
+        "click the search bar",
+        "open search",
+        "open spotify search",
+    } and ("spotify" in norm or _current_focus_is_spotify()):
+        return {"action": "sequence", "steps": [
+            {"action": "focus_app", "target": "spotify"},
+            {"action": "press_key", "target": "ctrl+l"},
+        ]}
+
+    return None

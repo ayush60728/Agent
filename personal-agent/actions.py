@@ -36,6 +36,7 @@ from app_resolver import find_app
 from folder_resolver import find_folder
 from desktop_actions import click_text as _click_text
 from desktop_actions import click_at as _click_at
+from desktop_actions import move_to as _move_to
 from desktop_actions import type_text as _type_text
 from desktop_actions import press_key as _press_key
 from desktop_actions import wait as _wait
@@ -182,7 +183,21 @@ def click_text(target_text: str):
     return _click_text(target_text)
 
 
-def click_at(x, y, label: str = "that") -> str:
+def right_click_text(target_text: str):
+    """Find text on screen and right-click it. Same focus guard and ambiguity
+    flow as click_text, but uses the right mouse button for the final click."""
+
+    if not target_text:
+        return "I need some text to right-click."
+
+    error = _ensure_focused_app_active()
+    if error:
+        return error
+
+    return _click_text(target_text, button="right")
+
+
+def click_at(x, y, label: str = "that", button: str = "left") -> str:
     """Click an absolute screen coordinate the user chose during
     disambiguation. Re-focuses the tracked app first: the pick arrives a turn
     after the numbered prompt, by which point typing/speaking the choice has
@@ -197,7 +212,17 @@ def click_at(x, y, label: str = "that") -> str:
     if error:
         return error
 
-    return _click_at(x, y, label)
+    return _click_at(x, y, label, button=button)
+
+
+def move_to(x, y, label: str = "that") -> str:
+    """Move the cursor to a disambiguation candidate without clicking."""
+
+    error = _ensure_focused_app_active()
+    if error:
+        return error
+
+    return _move_to(x, y, label)
 
 
 def type_text(text: str) -> str:
@@ -272,6 +297,12 @@ def get_color(target: str = "") -> str:
     return _get_color(target or "")
 
 
+def switch_app_picker() -> str:
+    """Open Windows Task View, equivalent to the three-finger swipe up."""
+
+    return _press_key("win+tab")
+
+
 def execute_action(action: dict) -> str:
     """
     Dispatch a structured action to the right handler.
@@ -303,12 +334,20 @@ def execute_action(action: dict) -> str:
     if action_type == "click_text":
         return click_text(action.get("target", ""))
 
+    if action_type == "right_click_text":
+        return right_click_text(action.get("target", ""))
+
     if action_type == "click_at":
         # Internal action: a disambiguated click on stored coordinates. Not
         # user/LLM-facing (see click_at above) — constructed by the
         # disambiguation handler in agent.process_command.
         return click_at(action.get("x"), action.get("y"),
-                        action.get("label", "that"))
+                        action.get("label", "that"),
+                        action.get("button", "left"))
+
+    if action_type == "move_to":
+        return move_to(action.get("x"), action.get("y"),
+                       action.get("label", "that"))
 
     if action_type == "type_text":
         return type_text(action.get("target", ""))
@@ -327,6 +366,9 @@ def execute_action(action: dict) -> str:
 
     if action_type == "get_color":
         return get_color(action.get("target", ""))
+
+    if action_type == "switch_app_picker":
+        return switch_app_picker()
 
     return f"Unknown action: {action_type}"
 

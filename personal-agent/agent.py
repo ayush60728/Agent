@@ -5,10 +5,11 @@ import sys
 import ollama
 
 from actions import execute_action
-from builtin_commands import get_builtin_action
+from builtin_commands import get_builtin_action, get_smart_builtin_action
 from prompt_cache import get_cached_action, save_action, forget_prompt, normalize_prompt
 import confirmation
 import disambiguation
+import app_switch
 
 
 MODEL = "qwen3-nothink"  # custom model with /no_think baked into its
@@ -89,6 +90,16 @@ right control among look-alikes:
 {
     "action": "click_text",
     "target": "red submit"
+}
+
+4b. right_click_text
+Use this when the user specifically asks to right-click something visible on
+screen.
+
+Format:
+{
+    "action": "right_click_text",
+    "target": "text visible on screen"
 }
 
 5. type_text
@@ -178,6 +189,17 @@ Format:
     "target": "" or "element text"
 }
 
+12. switch_app_picker
+Use this when the user asks to switch apps, switch tabs in the Windows
+three-finger gesture sense, show open apps, or open Task View. The agent will
+ask which app to focus next.
+
+Format:
+{
+    "action": "switch_app_picker",
+    "target": ""
+}
+
 MEDIA & VOLUME: media playback and system volume are done with press_key
 using the special media keys. Map them like this:
 - play / pause / resume        -> press_key "playpause"
@@ -186,6 +208,11 @@ using the special media keys. Map them like this:
 - volume up / louder           -> press_key "volumeup"
 - volume down / quieter        -> press_key "volumedown"
 - mute / unmute                -> press_key "volumemute"
+
+SPOTIFY SEARCH/PLAY: Spotify has its own in-app search. Do NOT invent a
+"search" action. If the user asks to search for or play a named song/artist in
+Spotify, use a sequence: focus or open Spotify, wait if opened, press_key
+"ctrl+l", type_text the query, press_key "enter", wait 1, press_key "enter".
 
 MULTI-STEP REQUESTS: If the user asks for several actions in one sentence
 (e.g. "open brave, go to youtube and search for cats", "open notepad and type
@@ -263,6 +290,10 @@ Output:
 User: click on submit
 Output:
 {"action":"click_text","target":"submit"}
+
+User: right-click on search
+Output:
+{"action":"right_click_text","target":"search"}
 
 User: type youtube.com
 Output:
@@ -375,6 +406,14 @@ Output:
 User: open brave, go to youtube and search for cat videos
 Output:
 {"steps":[{"action":"open_app","target":"brave"},{"action":"wait","target":2},{"action":"press_key","target":"ctrl+l"},{"action":"type_text","target":"youtube.com"},{"action":"press_key","target":"enter"},{"action":"wait","target":2},{"action":"type_text","target":"cat videos"},{"action":"press_key","target":"enter"}]}
+
+User: open spotify and play famous
+Output:
+{"steps":[{"action":"open_app","target":"spotify"},{"action":"wait","target":2},{"action":"press_key","target":"ctrl+l"},{"action":"type_text","target":"famous"},{"action":"press_key","target":"enter"},{"action":"wait","target":1},{"action":"press_key","target":"enter"}]}
+
+User: search famous in spotify
+Output:
+{"steps":[{"action":"focus_app","target":"spotify"},{"action":"press_key","target":"ctrl+l"},{"action":"type_text","target":"famous"},{"action":"press_key","target":"enter"},{"action":"wait","target":1},{"action":"press_key","target":"enter"}]}
 """
 
 
@@ -384,12 +423,14 @@ ALLOWED_ACTIONS = {
     "focus_app",
     "close_app",
     "click_text",
+    "right_click_text",
     "type_text",
     "press_key",
     "scroll",
     "screenshot",
     "get_color",
     "wait",
+    "switch_app_picker",
 }
 
 
@@ -534,7 +575,7 @@ def validate_action(action):
     if action_type not in ALLOWED_ACTIONS:
         return False, f"Action '{action_type}' is not allowed."
 
-    if action_type in ("open_app", "open_folder", "focus_app", "click_text", "type_text", "press_key", "scroll"):
+    if action_type in ("open_app", "open_folder", "focus_app", "click_text", "right_click_text", "type_text", "press_key", "scroll"):
         target = action.get("target")
 
         if not isinstance(target, str) or not target.strip():
@@ -583,6 +624,12 @@ def validate_action(action):
         if target < 0:
             return False, "Wait target must be non-negative."
 
+    if action_type == "switch_app_picker":
+        target = action.get("target")
+
+        if target is not None and not isinstance(target, str):
+            return False, "Switch-app target must be text."
+
     return True, None
 
 
@@ -626,6 +673,8 @@ def _brief_single(action: dict, result: str) -> str:
         return result  # already short ("closed brave")
     if kind == "click_text" and low.startswith("clicked"):
         return f"Clicked {target}." if target else "Clicked it."
+    if kind == "right_click_text" and low.startswith("right-clicked"):
+        return f"Right-clicked {target}." if target else "Right-clicked it."
     if kind == "type_text":
         return "Typed that in."
     if kind == "press_key":
@@ -679,6 +728,9 @@ def _brief_phrases(steps) -> list[str]:
                 i += 1
         elif kind == "click_text":
             phrases.append(f"clicking {target}")
+            i += 1
+        elif kind == "right_click_text":
+            phrases.append(f"right-clicking {target}")
             i += 1
         elif kind == "scroll":
             phrases.append(f"scrolling {target}")
@@ -814,6 +866,22 @@ def process_command(user_input: str, write_pet_state=None, for_speech: bool = Fa
             _pet("idle")
             return "I didn't catch that."
 
+        # 0a. If Task View is open from "switch tabs/apps", the next utterance
+        # is the app name to focus. Let bare "brave" or "spotify" work here.
+        if app_switch.is_pending():
+            choice = app_switch.interpret(user_input)
+            if choice == "cancel":
+                app_switch.clear()
+                _pet("idle")
+                return "Okay, cancelled."
+            if choice != "unrelated":
+                app_switch.clear()
+                action = {"action": "focus_app", "target": choice}
+                print("⚙️ Executing (app choice):", action)
+                result = _dispatch(action, for_speech=for_speech)
+                _pet("idle")
+                return result
+
         # 0. If a destructive action is armed and waiting for confirmation,
         #    THIS input is the yes/no answer — interpret it here, before the
         #    classifier ever sees it (so "yes"/"no" never get sent to Qwen or
@@ -843,49 +911,87 @@ def process_command(user_input: str, write_pet_state=None, for_speech: bool = Fa
         #     builtin command or be sent to Qwen.
         if disambiguation.is_pending():
             ambig = disambiguation.pending()
+
+            # --- stage 2: cursor is already pointing at a candidate ---
+            # Wait for yes/no before actually clicking.
+            if disambiguation.is_confirming_preview():
+                decision = disambiguation.interpret_preview_confirmation(user_input)
+                if decision == "confirm":
+                    idx = disambiguation.pending_preview_index()
+                    cand = ambig.candidates[idx]
+                    resume_steps = disambiguation.pending_resume_steps()
+                    disambiguation.clear()
+                    action = {"action": "click_at", "x": cand["x"], "y": cand["y"],
+                              "label": disambiguation.describe_choice(ambig, idx),
+                              "button": cand.get("button", "left")}
+                    print("⚙️ Executing (preview confirmed):", action)
+                    result = execute_action(action)
+                    if for_speech:
+                        result = "Right-clicked that." if action.get("button") == "right" else "Clicked that."
+                    if resume_steps:
+                        result = _run_sequence(resume_steps, _prefix=[str(result)],
+                                               for_speech=for_speech)
+                    _pet("idle")
+                    return result
+                if decision == "reject":
+                    # User said no / wrong one — go back to the numbered list.
+                    disambiguation.clear_preview()
+                    _pet("idle")
+                    return ("Okay, let me show you the options again. "
+                            + disambiguation.prompt_for(ambig))
+                if decision == "cancel":
+                    disambiguation.clear()
+                    _pet("idle")
+                    return "Okay, cancelled."
+                # Unrecognised response — re-prompt for yes/no.
+                _pet("idle")
+                return ("Please say yes to click it, no to go back to the list, "
+                        "or cancel to stop.")
+
+            # --- stage 1: user names a candidate; move cursor there and ask. ---
             choice = disambiguation.interpret(user_input, ambig.candidates)
             if isinstance(choice, int):
                 cand = ambig.candidates[choice]
-                # Read the sequence tail (if this click was mid-sequence) BEFORE
-                # clearing — clear() drops it.
-                resume_steps = disambiguation.pending_resume_steps()
-                disambiguation.clear()
-                action = {"action": "click_at", "x": cand["x"], "y": cand["y"],
-                          "label": disambiguation.describe_choice(ambig, choice)}
-                print("⚙️ Executing (chosen):", action)
-                result = execute_action(action)
-                if for_speech:
-                    result = "Clicked that."
-                # "Ask & resume": if this click was one step of a sequence, carry
-                # on with the steps that came after it. _run_sequence re-arms this
-                # same gate if a later step is ambiguous too.
-                if resume_steps:
-                    result = _run_sequence(resume_steps, _prefix=[str(result)],
-                                           for_speech=for_speech)
+                # Move the cursor to that spot without clicking yet.
+                move_action = {"action": "move_to", "x": cand["x"], "y": cand["y"],
+                               "label": disambiguation.describe_choice(ambig, choice)}
+                print("⚙️ Executing (preview move):", move_action)
+                execute_action(move_action)
+                # Remember which candidate is being previewed so stage 2 knows.
+                disambiguation.preview(choice)
                 _pet("idle")
-                return result
+                return disambiguation.confirm_prompt(ambig, choice)
             if choice == "cancel":
                 disambiguation.clear()
                 _pet("idle")
                 return "Okay, cancelled."
-            # "unrelated": not a pick — drop the pending selection and treat
-            # this input as a brand-new command (fall through).
-            disambiguation.clear()
+            # Not a valid pick. Keep the pending selection alive and ask again
+            # instead of sending the user's correction to Qwen/terminal flow.
+            _pet("idle")
+            return ("I didn't catch which one. "
+                    + disambiguation.prompt_for(ambig))
 
         # 1. Curated builtins first — instant and deterministic (no LLM, no
         #    cache-file read). Covers the hottest commands: scroll, volume,
         #    media, copy/paste, new tab, and so on.
         action = get_builtin_action(user_input)
         from_builtin = action is not None
+        from_smart_builtin = False
+
+        if not from_builtin:
+            action = get_smart_builtin_action(user_input)
+            from_smart_builtin = action is not None
 
         # 2. Then the learned prompt cache — skip Qwen if we've classified
         #    this exact phrasing before.
-        if not from_builtin:
+        if not from_builtin and not from_smart_builtin:
             action = get_cached_action(user_input)
-        was_cached = (not from_builtin) and action is not None
+        was_cached = (not from_builtin and not from_smart_builtin) and action is not None
 
         if from_builtin:
             print("⚡ Built-in command (no LLM call)")
+        elif from_smart_builtin:
+            print("⚡ Smart built-in command (no LLM call)")
         elif was_cached:
             print("⚡ Using cached response (no LLM call)")
         else:
@@ -928,7 +1034,7 @@ def process_command(user_input: str, write_pet_state=None, for_speech: bool = Fa
         #    re-save a cache hit (it bumped its own hit_count already), and
         #    never persist a builtin (the builtin table already catches it,
         #    faster than the cache would).
-        if not from_builtin and not was_cached:
+        if not from_builtin and not from_smart_builtin and not was_cached:
             save_action(user_input, action)
 
         # 4. Destructive actions (close a window/tab/app) don't run on the
@@ -950,6 +1056,11 @@ def process_command(user_input: str, write_pet_state=None, for_speech: bool = Fa
         # tail), keeping this function's return type a plain string for every
         # caller.
         result = _dispatch(action, for_speech=for_speech)
+
+        if action.get("action") == "switch_app_picker":
+            app_switch.arm()
+            _pet("idle")
+            return "Which app do you want to open?"
 
         _pet("idle")
         return result
@@ -1057,7 +1168,7 @@ def _launch_video_pet():
     if os.path.exists(pyw):
         exe = pyw
     try:
-        # Pass our pid so the (now non-interactive, un-closeable) pet exits when
+        # Pass our pid so the (interactive-but-un-closeable) pet exits when
         # the agent does.
         subprocess.Popen([exe, script, "--parent-pid", str(os.getpid())], cwd=base)
     except OSError:
