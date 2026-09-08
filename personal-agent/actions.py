@@ -31,9 +31,17 @@ Handles both kinds of results find_app() can return:
 """
 
 import os
+import json
+import difflib
+import shlex
+import subprocess
+import shutil
+from pathlib import Path
 
+import context_memory
+import sandbox
 from app_resolver import find_app
-from folder_resolver import find_folder
+from folder_resolver import find_folder, KNOWN_FOLDERS
 from desktop_actions import click_text as _click_text
 from desktop_actions import click_at as _click_at
 from desktop_actions import move_to as _move_to
@@ -46,6 +54,101 @@ from desktop_actions import scroll as _scroll
 from desktop_actions import take_screenshot as _take_screenshot
 from desktop_actions import get_color as _get_color
 from desktop_actions import get_current_focus_app
+from sandbox import check_path
+
+
+# ---------------------------------------------------------------------------
+# Helper functions for path resolution and fuzzy suggestions
+# ---------------------------------------------------------------------------
+
+_APP_CACHE_FILE = Path(__file__).parent / "app_paths.json"
+
+
+def _resolve_path(path_str: str) -> Path:
+    """Resolve a possibly-relative path against USERPROFILE.
+
+    Relative paths (no drive letter + backslash prefix) are joined to
+    %USERPROFILE% so the user can say 'Documents\\report.docx' and have it
+    land at C:\\Users\\ayush\\Documents\\report.docx.  Absolute paths are
+    returned as-is (as a Path object).
+    """
+    p = Path(path_str)
+    if not p.is_absolute():
+        p = Path(os.environ.get("USERPROFILE", "")) / p
+    return p
+
+
+def _did_you_mean_app(target: str) -> str | None:
+    """Fuzzy-match target against app_paths.json keys and KNOWN_FOLDERS keys.
+    Returns the best match name if ratio >= 0.7, else None."""
+    try:
+        with open(_APP_CACHE_FILE, "r", encoding="utf-8") as f:
+            app_keys = list(json.load(f).keys())
+    except (OSError, json.JSONDecodeError):
+        app_keys = []
+
+    candidates = app_keys + list(KNOWN_FOLDERS.keys())
+    if not candidates:
+        return None
+
+    t = target.lower().strip()
+    best_name, best_ratio = None, 0.0
+    for name in candidates:
+        ratio = difflib.SequenceMatcher(None, t, name.lower()).ratio()
+        if ratio > best_ratio:
+            best_ratio = ratio
+            best_name = name
+
+    return best_name if best_ratio >= 0.7 else None
+
+
+def _did_you_mean_folder(target: str) -> str | None:
+    """Fuzzy-match target against KNOWN_FOLDERS keys only.
+    Returns the best match name if ratio >= 0.7, else None."""
+    t = target.lower().strip()
+    best_name, best_ratio = None, 0.0
+    for name in KNOWN_FOLDERS.keys():
+        ratio = difflib.SequenceMatcher(None, t, name.lower()).ratio()
+        if ratio > best_ratio:
+            best_ratio = ratio
+            best_name = name
+    return best_name if best_ratio >= 0.7 else None
+
+
+# ---------------------------------------------------------------------------
+# File actions
+# ---------------------------------------------------------------------------
+
+def copy_file(source: str, destination: str) -> str:
+    """Copy source to destination; both are sandbox-checked first."""
+    src = _resolve_path(source)
+    dst = _resolve_path(destination)
+
+    blocked = check_path(str(src))
+    if blocked:
+        return blocked
+    blocked = check_path(str(dst))
+    if blocked:
+        return blocked
+
+    if not src.exists():
+        return f"I couldn't find '{src}'. Check the file name and try again."
+
+    if dst.exists():
+        return (f"A file already exists at '{dst}'. "
+                "Say 'overwrite' to replace it, or choose a different name.")
+
+    try:
+        if src.is_dir():
+            shutil.copytree(str(src), str(dst))
+        else:
+            shutil.copy2(str(src), str(dst))
+    except OSError as e:
+        import traceback
+        traceback.print_exc()
+        return f"Something went wrong: {type(e).__name__}: {e}"
+
+    return f"Copied '{src}' to '{dst}'."
 
 
 def open_app(app_name: str) -> str:
@@ -71,6 +174,11 @@ def open_app(app_name: str) -> str:
         # Window may take a beat to appear after startfile returns —
         # give focus_app a couple of retries before giving up.
         _focus_app(app_name, retries=3, retry_delay=0.5)
+        context_memory.update(
+            last_opened_app=app_name,
+            last_focused_app=app_name,
+            last_action={"action": "open_app", "target": app_name},
+        )
         return f"Opened {app_name}."
 
     try:
@@ -107,6 +215,9 @@ def open_folder(folder_name: str) -> str:
 
     try:
         os.startfile(path)
+        context_memory.update(
+            last_action={"action": "open_folder", "target": folder_name},
+        )
         return f"Opened {folder_name}."
 
     except (FileNotFoundError, OSError):
@@ -117,6 +228,9 @@ def open_folder(folder_name: str) -> str:
 
         try:
             os.startfile(path)
+            context_memory.update(
+                last_action={"action": "open_folder", "target": folder_name},
+            )
             return f"Opened {folder_name}."
         except OSError as e:
             return f"I found {folder_name}, but couldn't open it: {e}"
@@ -129,7 +243,15 @@ def focus_app(app_name: str) -> str:
     if not app_name:
         return "I need an app name to focus."
 
-    return _focus_app(app_name)
+    result = _focus_app(app_name)
+    # _focus_app returns "Switched to <name>." on success; only record
+    # memory when the switch actually worked — not on "is not running" errors.
+    if result.lower().startswith("switched"):
+        context_memory.update(
+            last_focused_app=app_name,
+            last_action={"action": "focus_app", "target": app_name},
+        )
+    return result
 
 
 def close_app(target: str = "") -> str:
@@ -143,6 +265,58 @@ def close_app(target: str = "") -> str:
     call _ensure_focused_app_active()."""
 
     return _close_app(target or "")
+
+
+def delete_file(target: str, with_contents: bool = False) -> str:
+    """Delete target, preferring the Recycle Bin (send2trash).
+    with_contents must be True for non-empty directories.
+    
+    Calls _resolve_path and sandbox.check_path, checks target exists,
+    detects non-empty folders and requires "and contents" phrase,
+    prefers send2trash over os.remove/shutil.rmtree with warning if unavailable.
+    """
+    path = _resolve_path(target)
+
+    # Sandbox check first
+    blocked = check_path(str(path))
+    if blocked:
+        return blocked
+
+    # Check if target exists
+    if not path.exists():
+        return f"I couldn't find '{path}'. Check the file name and try again."
+
+    # Check for non-empty directory
+    if path.is_dir() and any(path.iterdir()) and not with_contents:
+        return (f"'{path}' is a folder with contents. "
+                f"Say 'delete {path.name} and contents' to confirm recursive deletion.")
+
+    # Try send2trash first (Recycle Bin)
+    try:
+        import send2trash
+        send2trash.send2trash(str(path))
+        return f"Deleted '{path}' (sent to Recycle Bin)."
+    except ImportError:
+        # send2trash not available - fall back to permanent deletion
+        pass
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return f"Something went wrong: {type(e).__name__}: {e}"
+
+    # Permanent delete with warning (send2trash unavailable)
+    try:
+        if path.is_dir():
+            shutil.rmtree(str(path))
+        else:
+            os.remove(str(path))
+    except OSError as e:
+        import traceback
+        traceback.print_exc()
+        return f"Something went wrong: {type(e).__name__}: {e}"
+
+    return (f"Warning: send2trash is not installed — this deletion is permanent. "
+            f"Deleted '{path}'.")
 
 
 def _ensure_focused_app_active() -> str | None:
@@ -180,7 +354,16 @@ def click_text(target_text: str):
     if error:
         return error
 
-    return _click_text(target_text)
+    result = _click_text(target_text)
+    # Only record memory for a clean click — not for AmbiguousClick objects
+    # or error strings.  The disambiguation handler will record the final
+    # click when the user picks a candidate (via click_at below).
+    if isinstance(result, str) and result.lower().startswith("clicked"):
+        context_memory.update(
+            last_clicked_element=target_text,
+            last_action={"action": "click_text", "target": target_text},
+        )
+    return result
 
 
 def right_click_text(target_text: str):
@@ -194,7 +377,13 @@ def right_click_text(target_text: str):
     if error:
         return error
 
-    return _click_text(target_text, button="right")
+    result = _click_text(target_text, button="right")
+    if isinstance(result, str) and result.lower().startswith("right-clicked"):
+        context_memory.update(
+            last_clicked_element=target_text,
+            last_action={"action": "right_click_text", "target": target_text},
+        )
+    return result
 
 
 def click_at(x, y, label: str = "that", button: str = "left") -> str:
@@ -212,7 +401,13 @@ def click_at(x, y, label: str = "that", button: str = "left") -> str:
     if error:
         return error
 
-    return _click_at(x, y, label, button=button)
+    result = _click_at(x, y, label, button=button)
+    if isinstance(result, str) and result.lower().startswith(("clicked", "right-clicked")):
+        context_memory.update(
+            last_clicked_element=label,
+            last_action={"action": "click_at", "x": x, "y": y, "label": label, "button": button},
+        )
+    return result
 
 
 def move_to(x, y, label: str = "that") -> str:
@@ -236,7 +431,13 @@ def type_text(text: str) -> str:
     if error:
         return error
 
-    return _type_text(text)
+    result = _type_text(text)
+    if isinstance(result, str) and not result.lower().startswith(("error", "couldn't")):
+        context_memory.update(
+            last_typed_text=text,
+            last_action={"action": "type_text", "target": text},
+        )
+    return result
 
 
 def press_key(key: str) -> str:
@@ -303,6 +504,101 @@ def switch_app_picker() -> str:
     return _press_key("win+tab")
 
 
+# ---------------------------------------------------------------------------
+# run_command action with whitelist
+# ---------------------------------------------------------------------------
+
+ALLOWED_COMMANDS: frozenset[str] = frozenset({
+    "echo", "dir", "type", "ping", "ipconfig", "hostname",
+    "whoami", "ver", "date", "time",
+})
+
+# Windows CMD built-in commands that need to be invoked via cmd.exe /c
+_CMD_BUILTINS: frozenset[str] = frozenset({
+    "echo", "dir", "type", "ver", "date", "time",
+})
+
+
+def run_command(target: str) -> str:
+    """Run a whitelisted shell command; confirmation already obtained by gate.
+    
+    Only commands in ALLOWED_COMMANDS are permitted. Executes with subprocess.run
+    (shell=False, timeout=10), captures and truncates output to 500 chars,
+    returns specific error messages for blocked commands and timeouts.
+    
+    Windows built-in commands (echo, dir, type, ver, date, time) are executed
+    via cmd.exe /c to work with shell=False.
+    """
+    tokens = target.strip().split()
+    if not tokens:
+        return "I need a command to run."
+
+    prefix = tokens[0].lower()
+    if prefix not in ALLOWED_COMMANDS:
+        allowed_list = ", ".join(sorted(ALLOWED_COMMANDS))
+        return (f"Command '{prefix}' is not in the allowed list. "
+                f"Allowed commands: {allowed_list}.")
+
+    try:
+        args = shlex.split(target)
+    except ValueError as e:
+        return f"Something went wrong: ValueError: {e}"
+
+    # Windows CMD built-ins need to be invoked via cmd.exe /c
+    if prefix in _CMD_BUILTINS:
+        args = ["cmd.exe", "/c"] + args
+
+    try:
+        result = subprocess.run(
+            args,
+            capture_output=True,
+            text=True,
+            timeout=10,
+            shell=False,
+        )
+    except subprocess.TimeoutExpired:
+        return "The command timed out after 10 seconds."
+    except OSError as e:
+        import traceback
+        traceback.print_exc()
+        return f"Something went wrong: {type(e).__name__}: {e}"
+
+    output = (result.stdout or "") + (result.stderr or "")
+    if result.returncode != 0:
+        output = f"Command exited with code {result.returncode}. " + output
+
+    if len(output) > 500:
+        output = output[:500] + " ... [output truncated]"
+
+    return output
+
+
+def move_file(source: str, destination: str) -> str:
+    """Move source to destination (confirmation already obtained by the gate).
+    Both paths are sandbox-checked before any I/O."""
+    src = _resolve_path(source)
+    dst = _resolve_path(destination)
+
+    blocked = sandbox.check_path(str(src))
+    if blocked:
+        return blocked
+    blocked = sandbox.check_path(str(dst))
+    if blocked:
+        return blocked
+
+    if not src.exists():
+        return f"I couldn't find '{src}'. Check the file name and try again."
+
+    try:
+        shutil.move(str(src), str(dst))
+    except OSError as e:
+        import traceback
+        traceback.print_exc()
+        return f"Something went wrong: {type(e).__name__}: {e}"
+
+    return f"Moved '{src}' to '{dst}'."
+
+
 def execute_action(action: dict) -> str:
     """
     Dispatch a structured action to the right handler.
@@ -330,6 +626,16 @@ def execute_action(action: dict) -> str:
 
     if action_type == "close_app":
         return close_app(action.get("target", ""))
+
+    if action_type == "copy_file":
+        return copy_file(action.get("source", ""), action.get("destination", ""))
+
+    if action_type == "move_file":
+        return move_file(action.get("source", ""), action.get("destination", ""))
+
+    if action_type == "delete_file":
+        return delete_file(action.get("target", ""),
+                           bool(action.get("with_contents", False)))
 
     if action_type == "click_text":
         return click_text(action.get("target", ""))
@@ -369,6 +675,9 @@ def execute_action(action: dict) -> str:
 
     if action_type == "switch_app_picker":
         return switch_app_picker()
+
+    if action_type == "run_command":
+        return run_command(action.get("target", ""))
 
     return f"Unknown action: {action_type}"
 
