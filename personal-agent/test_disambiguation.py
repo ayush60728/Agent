@@ -145,7 +145,7 @@ check("empty", disambiguation.interpret("", C), "unrelated")
 
 
 # --- 4. integration via process_command -----------------------------------
-print("\n4. process_command — armed, picked, cancelled, superseded")
+print("\n4. process_command — armed, picked, cancelled, re-prompted")
 
 AMBIG = disambiguation.AmbiguousClick("submit", [
     {"x": 11, "y": 11, "desc": "top-left", "color": "blue"},
@@ -186,12 +186,20 @@ check_contains("ambiguous -> shows differing color", reply, "(red)")
 check("ambiguous -> only the classify ran, no click", _ran, [{"action": "click_text", "target": "submit"}])
 check_true("ambiguous -> selection pending", disambiguation.is_pending())
 
-# (b) "two" -> clicks candidate 2 via click_at, pending cleared
+# (b) "two" -> moves to candidate 2 via move_to, preview mode active, then "yes" clicks it
 _ran.clear()
 reply = run("two")
-check("pick 'two' -> click_at candidate 2", _ran,
-      [{"action": "click_at", "x": 22, "y": 22, "label": "the red center 'submit'"}])
-check("pick -> pending cleared", disambiguation.is_pending(), False)
+check("pick 'two' -> move_to candidate 2", _ran,
+      [{"action": "move_to", "x": 22, "y": 22,
+        "label": "the red center 'submit'"}])
+check_true("pick -> preview mode active", disambiguation.is_confirming_preview())
+
+_ran.clear()
+reply = run("yes")
+check("confirm 'yes' -> click_at candidate 2", _ran,
+      [{"action": "click_at", "x": 22, "y": 22,
+        "label": "the red center 'submit'", "button": "left"}])
+check("confirm -> pending cleared", disambiguation.is_pending(), False)
 
 # (c) "no" -> cancels, nothing clicked
 disambiguation.clear()
@@ -203,14 +211,18 @@ check("cancel -> nothing clicked", _ran, [])
 check_contains("cancel -> acknowledges", reply, "cancel")
 check("cancel -> pending cleared", disambiguation.is_pending(), False)
 
-# (d) unrelated command supersedes the pending selection (and runs itself)
+# (d) unrelated/non-choice input keeps the pending selection alive and asks
+#     again. This is the voice-friendly behavior: if the agent asked "which
+#     one?", the next thing it hears should not be sent to Qwen just because it
+#     was a messy pick like "hand to the top".
 disambiguation.clear()
 _ran.clear()
 run("click submit")             # arm (records the classify->execute)
-_ran.clear()                    # ignore the arming call; watch only the supersede
-reply = run("scroll down")      # not a pick -> drop pending, run as fresh cmd
-check("supersede -> ran scroll", _ran, [{"action": "scroll", "target": "down"}])
-check("supersede -> pending cleared", disambiguation.is_pending(), False)
+_ran.clear()                    # ignore the arming call; watch only the re-prompt
+reply = run("scroll down")      # not a pick -> keep asking which one
+check("re-prompt -> no new command ran", _ran, [])
+check_contains("re-prompt -> asks which one again", reply, "I didn't catch which one")
+check("re-prompt -> pending stays armed", disambiguation.is_pending(), True)
 
 # (e) a stale armed selection expires
 disambiguation.clear()

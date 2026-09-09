@@ -260,13 +260,21 @@ check("suspend -> tail stashed for resume",
       [{"action": "type_text", "target": "hello"},
        {"action": "press_key", "target": "enter"}])
 
-# (b) the pick clicks the chosen candidate, THEN continues the remaining steps
-#     in order — all in one resumed turn.
+# (b) the pick moves to the candidate, then "yes" clicks it AND resumes the tail
 _ran.clear()
 reply = run("two")
-check("pick -> click_at then the tail, in order",
+check("pick 'two' -> move_to candidate 2",
       _ran,
-      [{"action": "click_at", "x": 22, "y": 22, "label": "the red center 'submit'"},
+      [{"action": "move_to", "x": 22, "y": 22,
+        "label": "the red center 'submit'"}])
+check_true("pick -> preview mode active", disambiguation.is_confirming_preview())
+
+_ran.clear()
+reply = run("yes")
+check("confirm 'yes' -> click_at then the tail, in order",
+      _ran,
+      [{"action": "click_at", "x": 22, "y": 22,
+        "label": "the red center 'submit'", "button": "left"},
        {"action": "type_text", "target": "hello"},
        {"action": "press_key", "target": "enter"}])
 check("resume -> pending cleared", disambiguation.is_pending(), False)
