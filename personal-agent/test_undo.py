@@ -1,3 +1,4 @@
+import action_registry
 """
 test_undo.py
 
@@ -68,7 +69,7 @@ def main():
         check("dst exists", dst.exists(), True)
 
         # Undo move
-        undo_res = actions.execute_action({"action": "undo", "target": ""})
+        undo_res = action_registry.execute({"action": "undo", "target": ""})
         print(" ", undo_res)
         check("src restored", src.exists(), True)
         check("dst deleted after undo move", dst.exists(), False)
@@ -91,7 +92,7 @@ def main():
         check("copy_file result", copy_res, f"Copied '{src}' to '{dst}'.")
         check("dst copy created", dst.exists(), True)
 
-        undo_res = actions.execute_action({"action": "undo", "target": ""})
+        undo_res = action_registry.execute({"action": "undo", "target": ""})
         print(" ", undo_res)
         check("copy deleted after undo", dst.exists(), False)
         check("original src still exists", src.exists(), True)

@@ -1,3 +1,7 @@
+import action_runner
+import actions
+import intent_resolver
+import action_registry
 """
 test_sequence.py
 
@@ -5,7 +9,7 @@ Hermetic tests for the multi-step action scheduler. No Ollama, no screen, no
 cache writes:
 
   * normalize_action / validate_action / is_sequence are pure — tested directly;
-  * the integration cases drive agent.process_command() with agent.execute_action
+  * the integration cases drive agent.process_command() with action_registry.execute
     monkeypatched to a recorder (so nothing is really clicked/typed/closed), the
     builtin table and prompt cache stubbed out, and — for the parse path —
     agent.ask_qwen replaced with canned JSON. save_action is stubbed so no test
@@ -68,73 +72,73 @@ print("\n1. normalize_action — wrap/unwrap into single-action or sequence")
 
 # {"steps":[...]} and bare [...] with 2+ items -> a sequence.
 check("{'steps':[A,B]} -> sequence",
-      agent.normalize_action({"steps": [A, B]}),
+      intent_resolver.normalize_action({"steps": [A, B]}),
       {"action": "sequence", "steps": [A, B]})
 check("[A,B] -> sequence",
-      agent.normalize_action([A, B]),
+      intent_resolver.normalize_action([A, B]),
       {"action": "sequence", "steps": [A, B]})
 check("[A,B,C] -> sequence keeps order",
-      agent.normalize_action([A, B, C_]),
+      intent_resolver.normalize_action([A, B, C_]),
       {"action": "sequence", "steps": [A, B, C_]})
 
 # A one-item plan is just that action — keeps the single-action path unchanged.
-check("{'steps':[A]} -> unwrapped A", agent.normalize_action({"steps": [A]}), A)
-check("[A] -> unwrapped A", agent.normalize_action([A]), A)
+check("{'steps':[A]} -> unwrapped A", intent_resolver.normalize_action({"steps": [A]}), A)
+check("[A] -> unwrapped A", intent_resolver.normalize_action([A]), A)
 
 # A plain single action is returned untouched (the common case).
-check("single dict unchanged", agent.normalize_action(A), A)
+check("single dict unchanged", intent_resolver.normalize_action(A), A)
 
 # Idempotent: an already-canonical sequence passes straight through (it has an
 # "action" key, so the unwrap branch is correctly skipped).
 SEQ_AB = {"action": "sequence", "steps": [A, B]}
-check("sequence is idempotent", agent.normalize_action(SEQ_AB), SEQ_AB)
+check("sequence is idempotent", intent_resolver.normalize_action(SEQ_AB), SEQ_AB)
 
 # is_sequence recognizes only the canonical composite.
-check("is_sequence(sequence)", agent.is_sequence(SEQ_AB), True)
-check("is_sequence(single)", agent.is_sequence(A), False)
-check("is_sequence(non-dict)", agent.is_sequence([A, B]), False)
+check("is_sequence(sequence)", intent_resolver.is_sequence(SEQ_AB), True)
+check("is_sequence(single)", intent_resolver.is_sequence(A), False)
+check("is_sequence(non-dict)", intent_resolver.is_sequence([A, B]), False)
 
 
 # --- 2. validate_action — the sequence wrapper -----------------------------
 print("\n2. validate_action — sequence length, per-step, no nesting")
 
-ok, err = agent.validate_action({"action": "sequence", "steps": [A, B, C_]})
+ok, err = intent_resolver.validate_action({"action": "sequence", "steps": [A, B, C_]})
 check("valid sequence passes", (ok, err), (True, None))
 
 # A bad step fails, and the error names which step.
-ok, err = agent.validate_action(
+ok, err = intent_resolver.validate_action(
     {"action": "sequence", "steps": [A, {"action": "frobnicate", "target": "x"}]})
 check("invalid step -> rejected", ok, False)
 check_contains("invalid step -> error names step 2", err, "Step 2")
 
 # A step may not itself be a sequence (no nesting).
-ok, err = agent.validate_action(
+ok, err = intent_resolver.validate_action(
     {"action": "sequence", "steps": [A, {"action": "sequence", "steps": [B, C_]}]})
 check("nested sequence -> rejected", ok, False)
 check_contains("nested -> explains no nesting", err, "another sequence")
 
 # A "sequence" that is too short shouldn't exist post-normalization, but a raw
 # one is malformed rather than a real plan.
-ok, err = agent.validate_action({"action": "sequence", "steps": [A]})
+ok, err = intent_resolver.validate_action({"action": "sequence", "steps": [A]})
 check("1-step sequence -> rejected", ok, False)
-ok, err = agent.validate_action({"action": "sequence", "steps": []})
+ok, err = intent_resolver.validate_action({"action": "sequence", "steps": []})
 check("0-step sequence -> rejected", ok, False)
-ok, err = agent.validate_action({"action": "sequence", "steps": "nope"})
+ok, err = intent_resolver.validate_action({"action": "sequence", "steps": "nope"})
 check("non-list steps -> rejected", ok, False)
 
 # Over the cap is rejected (runaway-plan guard).
-big = {"action": "sequence", "steps": [dict(A) for _ in range(agent.MAX_STEPS + 1)]}
-ok, err = agent.validate_action(big)
+big = {"action": "sequence", "steps": [dict(A) for _ in range(intent_resolver.MAX_STEPS + 1)]}
+ok, err = intent_resolver.validate_action(big)
 check("> MAX_STEPS -> rejected", ok, False)
-check_contains("over-cap -> mentions the limit", err, str(agent.MAX_STEPS))
+check_contains("over-cap -> mentions the limit", err, str(intent_resolver.MAX_STEPS))
 
 # At the cap is allowed.
-atcap = {"action": "sequence", "steps": [dict(A) for _ in range(agent.MAX_STEPS)]}
-ok, err = agent.validate_action(atcap)
+atcap = {"action": "sequence", "steps": [dict(A) for _ in range(intent_resolver.MAX_STEPS)]}
+ok, err = intent_resolver.validate_action(atcap)
 check("== MAX_STEPS -> allowed", (ok, err), (True, None))
 
 # "sequence" is deliberately NOT a standalone allowed action.
-check("'sequence' not in ALLOWED_ACTIONS", "sequence" in agent.ALLOWED_ACTIONS, False)
+check("'sequence' not in ALLOWED_ACTIONS", "sequence" in action_registry.generate_allowed_set(), False)
 
 
 # --- shared recorder for the integration cases ------------------------------
@@ -158,12 +162,12 @@ def _recorder(action):
 
 # Neutralize every real side-effect path. process_command resolves these names
 # at call time, so reassigning them here fully sandboxes it.
-agent.execute_action = _recorder
+action_registry.execute = _recorder
 agent.get_builtin_action = lambda text: None      # never short-circuit to a builtin
 agent.save_action = lambda *a, **k: None           # never write prompt_cache.json
 
 _cached = {"val": None}                            # per-case cache stand-in
-agent.get_cached_action = lambda text: _cached["val"]
+intent_resolver.get_cached_action = lambda text: _cached["val"]
 
 
 def run(text):
@@ -187,14 +191,14 @@ steps = [
     {"action": "type_text", "target": "hello world"},
     {"action": "press_key", "target": "ctrl+s"},
 ]
-reply = agent._run_sequence(steps)
+reply = action_runner._run_sequence(steps)
 check("all steps ran in order", _ran, steps)
 check_contains("reply aggregates first step", reply, "[ran open_app:notepad]")
 check_contains("reply aggregates last step", reply, "[ran press_key:ctrl+s]")
 
 # _prefix seeds the reply with lines from steps that ran in an earlier turn.
 reset()
-reply = agent._run_sequence([{"action": "scroll", "target": "down"}], _prefix=["PRIOR"])
+reply = action_runner._run_sequence([{"action": "scroll", "target": "down"}], _prefix=["PRIOR"])
 check("_prefix carried into reply", reply.startswith("PRIOR"), True)
 check("_prefix + tail ran", _ran, [{"action": "scroll", "target": "down"}])
 
@@ -294,7 +298,7 @@ print("\n6. process_command — parse a multi-step plan straight from the LLM")
 
 # (a) a {"steps":[...]} object string.
 reset()
-agent.ask_qwen = lambda text: (
+intent_resolver.ask_qwen = lambda text: (
     '{"steps":[{"action":"open_app","target":"notepad"},'
     '{"action":"type_text","target":"hi"}]}')
 reply = run("open notepad and type hi")
@@ -306,7 +310,7 @@ check("object plan parsed & ran in order",
 # (b) a top-level [...] array string — the leading-'[' branch of the extractor
 #     (a greedy {.*} would drop the brackets and corrupt the JSON).
 reset()
-agent.ask_qwen = lambda text: (
+intent_resolver.ask_qwen = lambda text: (
     '[{"action":"scroll","target":"down"},{"action":"scroll","target":"up"}]')
 reply = run("scroll down then back up")
 check("array plan parsed & ran in order",
@@ -317,7 +321,7 @@ check("array plan parsed & ran in order",
 # (c) a single-action string is unwrapped and runs as one action (regression:
 #     the common case is untouched by the multi-step machinery).
 reset()
-agent.ask_qwen = lambda text: '{"action":"open_app","target":"brave"}'
+intent_resolver.ask_qwen = lambda text: '{"action":"open_app","target":"brave"}'
 reply = run("open brave")
 check("single action still runs as one", _ran, [{"action": "open_app", "target": "brave"}])
 

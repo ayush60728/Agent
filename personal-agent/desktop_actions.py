@@ -1,4 +1,5 @@
 import os
+import re
 import time
 from collections import namedtuple
 from pathlib import Path
@@ -8,8 +9,12 @@ import pytesseract
 import pygetwindow as gw
 from PIL import Image
 
+import cancel_token
 import color_vision
+import config
 import disambiguation
+import ocr_cache
+from retry import with_retry, RetryExhausted
 
 pyautogui.PAUSE = 0.1  # small delay after each pyautogui call, avoids race conditions
 
@@ -256,30 +261,50 @@ def find_text_matches(target_text: str):
     consolidated matches for target_text as a list of Match tuples in absolute
     screen coordinates, best-first. Empty list if nothing matches.
 
-    Beyond finding hits, this ranks them: an exact word match outranks a partial
-    one, and OCR's own per-word confidence breaks ties and filters noise (a
-    low-confidence fuzzy hit is dropped). Overlapping/adjacent same-line boxes
-    are merged so a split label ('Sign' + 'In') or a multi-word target counts as
-    one candidate, not several — which is what keeps the disambiguation prompt
-    from firing on OCR artefacts. find_text_on_screen() wraps this for callers
-    that only want the best hit."""
+    Performance features:
+      - Cancel-token check at entry: returns [] immediately if a new command
+        was issued while we were waiting.
+      - OCR result cache (ocr_cache.CACHE) keyed on (screenshot-hash, target):
+        3-second TTL means repeated calls for the same unchanged button are free.
+      - 15-second Tesseract timeout: stalled OCR raises an error instead of
+        freezing the voice loop.
+    """
+    # 1. Cancel check
+    if cancel_token.GLOBAL_TOKEN.cancelled:
+        return []
+
+    # 2. Capture screenshot
     left, top, width, height = _active_window_bounds()
     screenshot = pyautogui.screenshot(region=(left, top, width, height))
     offset_x, offset_y = left, top
-
-    data = pytesseract.image_to_data(screenshot, output_type=pytesseract.Output.DICT)
-
     target_lower = target_text.lower().strip()
-    raw = []
 
+    # 3. OCR cache lookup
+    img_hash = ocr_cache.screen_hash(screenshot)
+    cached = ocr_cache.CACHE.get(img_hash, target_lower)
+    if cached is not None:
+        print(f"[OCR-CACHE HIT] '{target_lower}' ({len(cached)} match(es))")
+        return cached
+
+    # 4. Run Tesseract with timeout + 1 retry
+    def _run_ocr():
+        return pytesseract.image_to_data(screenshot, output_type=pytesseract.Output.DICT)
+
+    try:
+        data = with_retry(_run_ocr, retries=1, base_delay=0.5, timeout=15,
+                          label="Tesseract OCR")
+    except (RetryExhausted, TimeoutError) as exc:
+        print(f"[OCR] Tesseract failed: {exc}")
+        return []
+
+    # 5. Score matches
+    raw = []
     for i in range(len(data['text'])):
         word = data['text'][i].strip().lower()
         if not word:
             continue
 
-        # Match quality: an exact word beats a prefix/superstring, which beats a
-        # fragment of a multi-word target. (Old behaviour treated all three as
-        # equal, unranked hits — this is the ranking it was missing.)
+        # Match quality: exact > prefix/superstring > word fragment
         exact = (word == target_lower)
         if exact:
             quality = 1.0
@@ -297,14 +322,16 @@ def find_text_matches(target_text: str):
         l = offset_x + data['left'][i]
         t = offset_y + data['top'][i]
         w = data['width'][i]
-        h = data['height'][i]
+        h_box = data['height'][i]
         score = quality * max(conf, 0.0) / 100.0
-        raw.append(Match(l + w // 2, t + h // 2, (l, t, w, h), score, exact))
+        raw.append(Match(l + w // 2, t + h_box // 2, (l, t, w, h_box), score, exact))
 
     merged = _merge_matches(raw)
-    # Exact matches first, then by score — so the best candidate is matches[0]
-    # for callers that only want one, and the numbered list reads best-first.
+    # Exact matches first, then by score — best candidate is matches[0]
     merged.sort(key=lambda m: (m.exact, m.score), reverse=True)
+
+    # 6. Store in cache
+    ocr_cache.CACHE.put(img_hash, target_lower, merged)
     return merged
 
 
@@ -376,7 +403,7 @@ def _filter_by_color(matches, color, floor=0.06):
     return strong
 
 
-def click_text(target_text: str):
+def click_text(target_text: str, button: str = "left"):
     """Locate target_text in the active window and click it. Returns a result
     string, OR — when 2+ equally-plausible matches remain after scoring and
     consolidation — an AmbiguousClick for process_command to resolve with the
@@ -396,17 +423,17 @@ def click_text(target_text: str):
             narrowed = _filter_by_color(matches, color)
             if len(narrowed) == 1:
                 m = narrowed[0]
-                return _do_click((m.cx, m.cy), f"the {color} '{locate}'")
+                return _do_click((m.cx, m.cy), f"the {color} '{locate}'", button=button)
             candidates = narrowed if narrowed else matches
 
         if len(candidates) == 1:
             m = candidates[0]
             label = f"the {color} '{locate}'" if color else f"'{locate}'"
-            return _do_click((m.cx, m.cy), label)
+            return _do_click((m.cx, m.cy), label, button=button)
 
         # 2+ genuinely-distinct candidates remain: don't gamble on matches[0]
         # (the old coin flip) — surface the ambiguity so the user picks.
-        return _build_ambiguous(locate, candidates)
+        return _build_ambiguous(locate, candidates, button=button)
 
     # OCR found no text. Fall back to the Windows UI Automation tree, which
     # exposes icon-only controls (hamburger menu, gear, back arrow, close X)
@@ -418,20 +445,27 @@ def click_text(target_text: str):
         if pos is not None:
             print(f"(no visible text — matched '{locate}' "
                   f"via the accessibility tree)")
-            return _do_click(pos, f"'{locate}'")
+            return _do_click(pos, f"'{locate}'", button=button)
     except Exception:
         pass
 
     return f"couldn't find '{target_text}' on screen"
 
 
-def _build_ambiguous(locate, candidates):
+MAX_AMBIGUOUS_CHOICES = 6
+
+
+def _build_ambiguous(locate, candidates, button: str = "left"):
     """Package 2+ rival matches into an AmbiguousClick for the disambiguation
     gate. Each candidate gets a position label; a color name is added only when
     the candidates differ in color, so three 'submit' buttons in different spots
     read by position while a red/green pair reads by color — and a same-color
     set doesn't clutter the prompt with a redundant color on every line."""
     win = _active_window_bounds()
+
+    # Voice UX falls apart when OCR returns dozens of tiny/duplicate-looking
+    # matches. Keep only the strongest few candidates for the spoken prompt.
+    candidates = sorted(candidates, key=lambda m: m.score, reverse=True)[:MAX_AMBIGUOUS_CHOICES]
 
     colors = []
     for m in candidates:
@@ -448,23 +482,35 @@ def _build_ambiguous(locate, candidates):
             "y": m.cy,
             "desc": describe_position(m.box, win),
             "color": (col if show_color else None),
+            "button": button,
         }
         for m, col in zip(candidates, colors)
     ]
     return disambiguation.AmbiguousClick(text=locate, candidates=cand_dicts)
 
 
-def _do_click(pos, label) -> str:
-    pyautogui.click(pos[0], pos[1])
-    return f"clicked {label} at {pos}"
+def _do_click(pos, label, button: str = "left") -> str:
+    """Click and invalidate the OCR cache — the screen state has changed."""
+    pyautogui.click(pos[0], pos[1], button=button)
+    ocr_cache.CACHE.invalidate_all()
+    prefix = "right-clicked" if button == "right" else "clicked"
+    return f"{prefix} {label} at {pos}"
 
 
-def click_at(x, y, label="that") -> str:
+def click_at(x, y, label="that", button: str = "left") -> str:
     """Click an absolute screen coordinate the user chose during
     disambiguation. Separate from _do_click so the disambiguation handler can
     construct a click straight from a candidate's stored (x, y)."""
-    pyautogui.click(x, y)
-    return f"clicked {label} at ({x}, {y})"
+    pyautogui.click(x, y, button=button)
+    ocr_cache.CACHE.invalidate_all()
+    prefix = "right-clicked" if button == "right" else "clicked"
+    return f"{prefix} {label} at ({x}, {y})"
+
+
+def move_to(x, y, label="that") -> str:
+    """Move the cursor to a candidate without clicking it."""
+    pyautogui.moveTo(x, y)
+    return f"pointing at {label} at ({x}, {y})"
 
 
 def get_color(target: str = "") -> str:
@@ -486,9 +532,6 @@ def get_color(target: str = "") -> str:
         return (f"the color under the cursor is {color_vision.name_color(r, g, b)} "
                 f"(RGB {r}, {g}, {b})")
 
-    # Named element: bring the tracked app forward (so we OCR the right
-    # window), locate the element (OCR first, then the accessibility tree),
-    # and name the dominant color of its area.
     if _current_focus_app:
         focus_app(_current_focus_app)
 
@@ -517,26 +560,43 @@ def get_color(target: str = "") -> str:
     return f"the '{cleaned}' looks {color_vision.name_color(r, g, b)}"
 
 
+def sanitize_text(text: str) -> str:
+    """Sanitize text to prevent keystroke sequence injection.
+
+    Converts raw newlines (\\n, \\r) and tabs (\\t) into single spaces,
+    and strips non-printable ASCII control characters (0x00-0x1F, 0x7F).
+    """
+    cleaned = re.sub(r'[\r\n\t]+', ' ', text)
+    cleaned = ''.join(c for c in cleaned if ord(c) >= 32 and ord(c) != 127)
+    return cleaned.strip()
+
+
 def type_text(text: str) -> str:
-    pyautogui.write(text, interval=0.02)
-    return f"typed '{text}'"
+    cleaned = sanitize_text(text)
+    if not cleaned:
+        return "No printable text to type after sanitization."
+
+    if getattr(config, "DRY_RUN", False):
+        return f"[DRY-RUN] Would type '{cleaned}'"
+
+    # Typing mutates the screen — invalidate OCR cache.
+    ocr_cache.CACHE.invalidate_all()
+    pyautogui.write(cleaned, interval=0.02)
+    return f"typed '{cleaned}'"
 
 
 def press_key(key: str) -> str:
-    # Supports combos like "ctrl+s" or single keys like "enter". Split on
-    # '+', trim whitespace around each part ("ctrl + s" is common from the
-    # LLM), lowercase, and drop empties so a stray/trailing '+' can't crash us.
     parts = [k.strip().lower() for k in key.split('+') if k.strip()]
     if not parts:
         return "I need a key to press."
 
-    # pyautogui.press() silently no-ops on an unknown key name, which reads to
-    # the user as "nothing happened" with no explanation — so check up front
-    # and say what we didn't recognise instead.
     valid = set(pyautogui.KEYBOARD_KEYS)
     unknown = [k for k in parts if k not in valid]
     if unknown:
         return f"I don't recognise the key(s): {', '.join(unknown)}"
+
+    if getattr(config, "DRY_RUN", False):
+        return f"[DRY-RUN] Would press '{key}'"
 
     try:
         if len(parts) == 1:
@@ -545,16 +605,14 @@ def press_key(key: str) -> str:
             pyautogui.hotkey(*parts)
     except Exception as e:
         return f"couldn't press '{key}': {e}"
+
+    # Key presses often change screen content — invalidate OCR cache.
+    ocr_cache.CACHE.invalidate_all()
     return f"pressed '{key}'"
 
 
 def scroll(direction: str, clicks: int = SCROLL_STEP) -> str:
-    """Scroll the focused window up or down.
-
-    Mouse-wheel events go to whatever window is under the cursor, not
-    necessarily the focused app — so first move the cursor over the center
-    of the active window (the agent re-focuses the target app right before
-    this runs), then scroll. Positive clicks scroll up, negative down."""
+    """Scroll the focused window up or down."""
     d = direction.strip().lower()
     if d in ("up", "u"):
         amount = clicks
@@ -563,6 +621,9 @@ def scroll(direction: str, clicks: int = SCROLL_STEP) -> str:
     else:
         return f"I can only scroll 'up' or 'down', not '{direction}'."
 
+    if getattr(config, "DRY_RUN", False):
+        return f"[DRY-RUN] Would scroll {d}"
+
     active = gw.getActiveWindow()
     if active is not None and active.width > 0 and active.height > 0:
         cx = active.left + active.width // 2
@@ -570,12 +631,17 @@ def scroll(direction: str, clicks: int = SCROLL_STEP) -> str:
         pyautogui.moveTo(cx, cy)
 
     pyautogui.scroll(amount)
+    # Scrolling changes the visible content — invalidate OCR cache.
+    ocr_cache.CACHE.invalidate_all()
     return f"scrolled {d}"
 
 
 def take_screenshot(name: str = "") -> str:
     """Capture the whole screen to a PNG in the user's Pictures folder
     (falling back to the home directory) and return the saved path."""
+    if getattr(config, "DRY_RUN", False):
+        return "[DRY-RUN] Would take screenshot"
+
     pictures = Path(os.environ.get("USERPROFILE", "")) / "Pictures"
     target_dir = pictures if pictures.is_dir() else Path.home()
 
@@ -592,5 +658,7 @@ def take_screenshot(name: str = "") -> str:
 
 
 def wait(seconds) -> str:
+    if getattr(config, "DRY_RUN", False):
+        return f"[DRY-RUN] Would wait {seconds}s"
     time.sleep(float(seconds))
     return f"waited {seconds}s"

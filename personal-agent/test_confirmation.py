@@ -1,10 +1,12 @@
+import actions
+import action_registry
 """
 test_confirmation.py
 
 Hermetic tests for the destructive-action confirmation gate. No Ollama, no
 screen, no cache writes: the integration cases drive agent.process_command()
 through BUILTIN phrasings (so the LLM is never called) and monkeypatch
-agent.execute_action to a recorder (so nothing is actually clicked/closed).
+action_registry.execute to a recorder (so nothing is actually clicked/closed).
 
 Run with the project venv:
     .venv/Scripts/python.exe test_confirmation.py
@@ -109,7 +111,7 @@ def _recorder(action):
     return f"[executed {action['action']}:{action.get('target')}]"
 
 
-agent.execute_action = _recorder  # process_command resolves this at call time
+action_registry.execute = _recorder  # process_command resolves this at call time
 
 
 def run(text):

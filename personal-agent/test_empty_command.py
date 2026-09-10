@@ -1,3 +1,6 @@
+import actions
+import intent_resolver
+import action_registry
 """
 test_empty_command.py
 
@@ -83,8 +86,10 @@ def _boom(*a, **k):
     raise AssertionError("ask_qwen must NOT be called for blank input")
 
 
-agent.execute_action = _recorder
-agent.ask_qwen = _boom
+_original_execute = action_registry.execute
+action_registry.execute = _recorder
+_original_ask_qwen = getattr(intent_resolver, "_original_ask_qwen", intent_resolver.ask_qwen)
+intent_resolver.ask_qwen = _boom
 
 for blank in (".", "", "   ", "?!", ",,,"):
     _ran.clear()
@@ -94,8 +99,10 @@ for blank in (".", "", "   ", "?!", ",,,"):
 
 # a real command still resolves (via the cache) and executes — proves the guard
 # only trips on genuinely empty input.
-agent.ask_qwen = _boom  # still must not be needed; "open brave" is cached
-agent.get_cached_action = lambda text: (
+_original_ask_qwen = getattr(intent_resolver, "_original_ask_qwen", intent_resolver.ask_qwen)
+intent_resolver.ask_qwen = _boom  # still must not be needed; "open brave" is cached
+_original_get_cached_action = getattr(intent_resolver, "_original_get_cached_action", intent_resolver.get_cached_action)
+intent_resolver.get_cached_action = lambda text: (
     {"action": "open_app", "target": "brave"}
     if prompt_cache.normalize_prompt(text) == "open brave" else None
 )
@@ -107,3 +114,8 @@ check_true("real command -> result string", isinstance(reply, str) and "open_app
 
 print("\n" + ("ALL PASSED" if _failures == 0 else f"{_failures} CHECK(S) FAILED"))
 sys.exit(1 if _failures else 0)
+
+# Restore mocks
+action_registry.execute = getattr(action_registry, "_original_execute", action_registry.execute)
+intent_resolver.ask_qwen = getattr(intent_resolver, "_original_ask_qwen", intent_resolver.ask_qwen)
+intent_resolver.get_cached_action = getattr(intent_resolver, "_original_get_cached_action", intent_resolver.get_cached_action)

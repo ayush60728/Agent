@@ -99,6 +99,16 @@ _DENY = {
     "never mind", "nevermind", "forget it", "leave it", "none",
     "none of them", "neither", "no thanks", "no thank you", "not that",
 }
+_REJECT_PREVIEW = {"no", "n", "nope", "nah", "not that", "wrong one"}
+_CANCEL_PREVIEW = {
+    "cancel", "stop", "dont", "abort", "never mind", "nevermind",
+    "forget it", "leave it", "none", "none of them", "neither",
+}
+_AFFIRM_PREVIEW = {
+    "yes", "y", "yeah", "yep", "yup", "sure", "ok", "okay", "confirm",
+    "confirmed", "do it", "go ahead", "go for it", "proceed", "correct",
+    "thats it", "that is it", "click it", "click that",
+}
 
 
 def _norm(text: str) -> str:
@@ -119,6 +129,16 @@ def _pos_tokens(s: str) -> set:
     return out
 
 
+def _candidate_pos_tokens(desc: str) -> set:
+    tokens = _pos_tokens(desc)
+    # describe_position shortens center-column/center-row positions:
+    # "top" means top-center, "left" means middle-left. Restore the implied
+    # center token so phrases like "middle top" can match naturally.
+    if desc in ("top", "bottom", "left", "right"):
+        tokens.add("center")
+    return tokens
+
+
 def _match_position(norm: str, candidates):
     """Index of the single candidate whose position matches the spoken phrase,
     or None if nothing matches or the phrase is ambiguous (e.g. "top" when two
@@ -127,7 +147,7 @@ def _match_position(norm: str, candidates):
     if not want:
         return None
     hits = [i for i, c in enumerate(candidates)
-            if want and want <= _pos_tokens(c.get("desc", ""))]
+            if want and want <= _candidate_pos_tokens(c.get("desc", ""))]
     return hits[0] if len(hits) == 1 else None
 
 
@@ -206,8 +226,14 @@ def prompt_for(ambig: AmbiguousClick) -> str:
         parts.append(label)
     listing = ", ".join(parts)
     n = len(ambig.candidates)
-    return (f"I found {n} '{ambig.text}' matches: {listing}. "
-            f"Say a number, or e.g. 'the top one'.")
+    return (f"I found {n} '{ambig.text}' matches on screen: {listing}. "
+            f"Which one do you want me to point at?")
+
+
+def confirm_prompt(ambig: AmbiguousClick, index: int) -> str:
+    return (f"I'm pointing at {describe_choice(ambig, index)}. "
+            f"Is this the button you want me to click? Say yes to click it, "
+            f"or no to choose again.")
 
 
 def describe_choice(ambig: AmbiguousClick, index: int) -> str:
@@ -223,7 +249,7 @@ def describe_choice(ambig: AmbiguousClick, index: int) -> str:
 # One armed selection at a time — same scope rationale as confirmation.py: only
 # one mode (text or voice) runs per process, each calling process_command
 # serially, so there's no concurrency to guard against.
-_pending = None  # {"ambig": AmbiguousClick, "resume_steps": list|None, "ts": float} or None
+_pending = None  # {"ambig": AmbiguousClick, "resume_steps": list|None, "selected": int|None, "ts": float} or None
 
 
 def arm(ambig: AmbiguousClick, resume_steps=None) -> None:
@@ -234,7 +260,12 @@ def arm(ambig: AmbiguousClick, resume_steps=None) -> None:
     standalone click — that keeps this signature backward-compatible with every
     existing single-click caller, which passes only the AmbiguousClick."""
     global _pending
-    _pending = {"ambig": ambig, "resume_steps": resume_steps, "ts": time.time()}
+    _pending = {
+        "ambig": ambig,
+        "resume_steps": resume_steps,
+        "selected": None,
+        "ts": time.time(),
+    }
 
 
 def is_pending() -> bool:
@@ -260,6 +291,39 @@ def pending_resume_steps():
     continuation), or None if this was a standalone click / nothing is pending.
     Read this BEFORE clear() when resolving a pick — clear() drops it."""
     return _pending.get("resume_steps") if is_pending() else None
+
+
+def preview(index: int) -> None:
+    """Remember which candidate the cursor is pointing at, awaiting yes/no."""
+    if is_pending():
+        _pending["selected"] = index
+        _pending["ts"] = time.time()
+
+
+def clear_preview() -> None:
+    """Return to the choice-list stage without dropping candidates/tail."""
+    if is_pending():
+        _pending["selected"] = None
+        _pending["ts"] = time.time()
+
+
+def pending_preview_index():
+    return _pending.get("selected") if is_pending() else None
+
+
+def is_confirming_preview() -> bool:
+    return pending_preview_index() is not None
+
+
+def interpret_preview_confirmation(text: str) -> str:
+    norm = _norm(text)
+    if norm in _AFFIRM_PREVIEW:
+        return "confirm"
+    if norm in _REJECT_PREVIEW:
+        return "reject"
+    if norm in _CANCEL_PREVIEW:
+        return "cancel"
+    return "unrelated"
 
 
 def take():

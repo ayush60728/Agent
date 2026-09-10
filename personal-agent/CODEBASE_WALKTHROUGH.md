@@ -8,7 +8,7 @@ The current milestone is:
 typed/spoken command -> local LLM -> validated JSON action -> Windows executor -> confirmation
 ```
 
-## Current File Map
+## Current File Map 
 
 ```text
 personal-agent/

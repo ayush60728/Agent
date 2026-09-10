@@ -13,8 +13,9 @@ Why this exists:
 
 Layering (see agent.process_command):
     1. builtin table  (this file — instant, in-memory, curated)
-    2. prompt cache   (learned from past LLM classifications)
-    3. Qwen           (anything genuinely novel)
+    2. user alias table (aliases.py — personal shortcuts saved by the user)
+    3. prompt cache   (learned from past LLM classifications)
+    4. Qwen           (anything genuinely novel)
 
 Matching is EXACT after the same light normalization the prompt cache uses
 (lowercase, trim, collapse whitespace, strip surrounding punctuation) — so
@@ -111,10 +112,15 @@ _COMMANDS = [
      {"action": "press_key", "target": "win+down"}),
     (["maximize", "maximize window", "maximize this", "maximize the window"],
      {"action": "press_key", "target": "win+up"}),
+    (["close window", "close this window", "close the window"],
+     {"action": "press_key", "target": "alt+f4"}),
 
     # --- screenshot ---
     (["screenshot", "take a screenshot", "take screenshot", "capture screen",
       "grab a screenshot"], {"action": "screenshot", "target": ""}),
+
+    # --- undo stack ---
+    (["undo last action", "undo action", "undo that"], {"action": "undo", "target": ""}),
 ]
 
 
@@ -245,4 +251,87 @@ def get_smart_builtin_action(prompt: str):
             {"action": "press_key", "target": "ctrl+l"},
         ]}
 
+    # --- Long-term memory commands ---
+    if norm in {"clear all memories", "clear memories", "delete all memories", "wipe memories", "forget all memories"}:
+        return {"action": "clear_memories", "target": ""}
+
+    if norm in {"list memories", "show memories", "view memories", "all memories", "show my memories"}:
+        return {"action": "list_memories", "target": ""}
+
+    if norm in {"how many memories", "memory count", "how many memories do you have", "count memories"}:
+        return {"action": "memory_count", "target": ""}
+
+    m = re.match(r"^(?:remember\s+that|remember|note\s+that|take\s+a\s+note(?:\s+that)?)\s+(.+)$", norm)
+    if m:
+        fact = m.group(1).strip()
+        if fact:
+            return {"action": "remember", "target": fact}
+
+    m = re.match(
+        r"^(?:what\s+do\s+you\s+know\s+about|what\s+do\s+you\s+remember\s+about|"
+        r"what\s+do\s+you\s+remember\s+for|do\s+you\s+remember|recall|"
+        r"search\s+memory\s+for|search\s+memories\s+for)\s+(.+)$",
+        norm,
+    )
+    if m:
+        query = m.group(1).strip()
+        if query:
+            return {"action": "recall", "target": query}
+
+    m = re.match(
+        r"^(?:forget\s+memory\s+about|forget\s+memory|forget\s+fact\s+about|forget\s+about)\s+(.+)$",
+        norm,
+    )
+    if m:
+        query = m.group(1).strip()
+        if query:
+            return {"action": "forget_memory", "target": query}
+
+    # --- Verbosity commands ---
+    if norm in {"set verbosity terse", "verbosity terse", "terse mode", "be terse", "be brief", "short mode", "quiet mode"}:
+        return {"action": "set_verbosity", "target": "terse"}
+
+    if norm in {"set verbosity detailed", "verbosity detailed", "detailed mode", "be detailed", "verbose mode", "be verbose", "full mode"}:
+        return {"action": "set_verbosity", "target": "detailed"}
+
+    # --- TTS Voice & Speech commands ---
+    if norm in {"list voices", "show voices", "available voices", "list tts voices", "all voices"}:
+        return {"action": "list_tts_voices", "target": ""}
+
+    m = re.match(r"^(?:set\s+voice\s+to|change\s+voice\s+to|switch\s+voice\s+to|use\s+voice)\s+(.+)$", norm)
+    if m:
+        voice_name = m.group(1).strip()
+        if voice_name:
+            return {"action": "set_tts_voice", "target": voice_name}
+
+    if norm in {"speak faster", "talk faster", "speed up speech", "faster speech"}:
+        return {"action": "set_tts_rate", "target": "faster"}
+
+    if norm in {"speak slower", "talk slower", "slow down speech", "slower speech"}:
+        return {"action": "set_tts_rate", "target": "slower"}
+
+    if norm in {"normal speech", "reset speech rate", "default speech rate"}:
+        return {"action": "set_tts_rate", "target": "normal"}
+
+    m = re.match(r"^(?:set\s+speech\s+rate|speech\s+rate|set\s+voice\s+rate|voice\s+rate)\s+(?:to\s+)?(\d+)$", norm)
+    if m:
+        return {"action": "set_tts_rate", "target": m.group(1)}
+
+    # --- Training commands ---
+    if norm in {"training stats", "show training stats", "training info", "how many corrections", "training count"}:
+        return {"action": "show_training_stats", "target": ""}
+
     return None
+
+
+def get_alias_action(prompt: str):
+    """Return the action saved under a user-defined alias for this prompt,
+    or None if no alias matches.
+
+    Sits between the curated builtin table and the prompt cache in the
+    resolution chain — instant (disk read, no LLM), and user-managed
+    rather than auto-learned.  A copy is returned by aliases.get_alias_action
+    already, so callers can mutate it freely.
+    """
+    from aliases import get_alias_action as _lookup
+    return _lookup(prompt)

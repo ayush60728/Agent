@@ -2,3 +2,6 @@
 # controls (hamburger menu, gear, close X) by their accessible name when OCR
 # finds no visible text. Pulls in comtypes automatically. See ui_automation.py.
 uiautomation>=2.0
+chromadb>=0.5.0
+pystray>=0.19.5
+pynput>=1.7.6

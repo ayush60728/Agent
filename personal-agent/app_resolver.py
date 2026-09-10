@@ -188,7 +188,11 @@ def search_registry(app_name: str):
                 capture_output=True,
                 text=True,
                 errors="ignore",
+                timeout=15,
             )
+        except subprocess.TimeoutExpired:
+            print(f"[RESOLVER] registry scan timed out for {location}")
+            continue
         except (OSError, subprocess.SubprocessError):
             continue
 
@@ -221,7 +225,11 @@ def search_start_apps(app_name: str):
             capture_output=True,
             text=True,
             errors="ignore",
+            timeout=15,
         )
+    except subprocess.TimeoutExpired:
+        print("[RESOLVER] Get-StartApps timed out")
+        return None
     except (OSError, subprocess.SubprocessError):
         return None
 

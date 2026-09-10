@@ -105,14 +105,14 @@ def _combo_parts(target) -> frozenset:
 
 def needs_confirmation(action) -> bool:
     """True if this action should be confirmed before it runs: any close_app,
-    or a press_key whose combo is in the destructive set. A sequence needs
-    confirmation if ANY of its steps does — the whole batch is then confirmed
-    up front (see agent.process_command), so no destructive step ever runs
-    unconfirmed."""
+    a press_key whose combo is in the destructive set, delete_file, move_file,
+    or run_command (always). A sequence needs confirmation if ANY of its steps
+    does — the whole batch is then confirmed up front (see agent.process_command),
+    so no destructive step ever runs unconfirmed."""
     if not isinstance(action, dict):
         return False
     kind = action.get("action")
-    if kind == "close_app":
+    if kind in ("close_app", "delete_file", "move_file", "copy_file", "rename_file", "run_command", "clear_memories"):
         return True
     if kind == "press_key":
         return _combo_parts(action.get("target", "")) in _DESTRUCTIVE_COMBOS
@@ -127,6 +127,8 @@ def describe(action) -> str:
     if not isinstance(action, dict):
         return "do that"
     kind = action.get("action")
+    if kind == "clear_memories":
+        return "clear all long-term memories"
     if kind == "sequence":
         # Only reached when the sequence is being confirmed, i.e. it contains at
         # least one destructive step. Name those steps — they're the reason we're
@@ -143,6 +145,24 @@ def describe(action) -> str:
     if kind == "close_app":
         target = (action.get("target") or "").strip()
         return f"close {target}" if target else "close the current window"
+    if kind == "delete_file":
+        target = (action.get("target") or "").strip()
+        return f"delete '{target}'"
+    if kind == "move_file":
+        src = (action.get("source") or "").strip()
+        dst = (action.get("destination") or "").strip()
+        return f"move '{src}' to '{dst}'"
+    if kind == "copy_file":
+        src = (action.get("source") or "").strip()
+        dst = (action.get("destination") or "").strip()
+        return f"copy '{src}' to '{dst}'"
+    if kind == "rename_file":
+        target = (action.get("target") or "").strip()
+        new_name = (action.get("new_name") or "").strip()
+        return f"rename '{target}' to '{new_name}'"
+    if kind == "run_command":
+        cmd = (action.get("target") or "").strip()
+        return f"run '{cmd}'"
     if kind == "press_key":
         parts = _combo_parts(action.get("target", ""))
         if parts in (frozenset({"ctrl", "w"}), frozenset({"ctrl", "f4"})):

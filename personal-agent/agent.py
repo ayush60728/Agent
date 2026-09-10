@@ -1,1075 +1,91 @@
-import argparse
-import json
-import re
-import sys
-import ollama
-
-from actions import execute_action
-from builtin_commands import get_builtin_action, get_smart_builtin_action
-from prompt_cache import get_cached_action, save_action, forget_prompt, normalize_prompt
-import confirmation
-import disambiguation
-import app_switch
-
-
-MODEL = "qwen3-nothink"  # custom model with /no_think baked into its
-                          # Modelfile — see Modelfile in this folder.
-                          # Run: ollama create qwen3-nothink -f Modelfile
-
-
-SYSTEM_PROMPT = """
-/no_think
-You are the reasoning core of a local Windows AI agent.
-
-Your job is to understand the user's request and convert it into a valid
-JSON action — a single action for a single request, or an ordered SEQUENCE of
-actions when the user asks for several things at once (see MULTI-STEP REQUESTS
-below). Ignore greetings, filler words, and politeness
-("hey", "can you", "please", "for me") — focus only on the actual request.
-
-You do NOT directly control Windows.
-
-Available actions:
-
-1. open_app
-Use this when the user wants to launch a program/application
-(e.g. a browser, editor, game, media player).
-
-Format:
-{
-    "action": "open_app",
-    "target": "application name"
-}
-
-2. open_folder
-Use this when the user wants to open a folder/directory in File
-Explorer. This includes Downloads, Documents, Desktop, Pictures, Music,
-Videos, or any custom named folder.
-
-Format:
-{
-    "action": "open_folder",
-    "target": "folder name"
-}
-
-CRITICAL RULE: If the user's request contains the word "folder", or
-names a common folder (downloads, documents, desktop, pictures, music,
-videos), you MUST use open_folder — never open_app. Do NOT use
-"explorer" or "file explorer" as a target; open_folder already handles
-opening File Explorer at the right location.
-
-3. focus_app
-Use this when the user wants to switch which already-open app the agent
-is interacting with (e.g. "move your focus to brave", "switch to
-spotify", "go back to vs code"). This does NOT launch the app — only
-open_app does that. Use focus_app when the app is presumably already
-running and the user just wants attention/clicks/typing directed at it.
-
-Do NOT use focus_app to CLOSE, quit, or exit an app — that is close_app
-(action 8). "close brave" means close it, not focus it.
-
-Format:
-{
-    "action": "focus_app",
-    "target": "application name"
-}
-
-4. click_text
-Use this when the user wants to click something on screen, identified
-by visible text (e.g. a button, link, menu item, search bar label).
-
-Format:
-{
-    "action": "click_text",
-    "target": "text visible on screen"
-}
-
-If the user mentions a COLOR ("click the red submit button", "the green
-one"), KEEP the color word in the target — the agent uses it to pick the
-right control among look-alikes:
-{
-    "action": "click_text",
-    "target": "red submit"
-}
-
-4b. right_click_text
-Use this when the user specifically asks to right-click something visible on
-screen.
-
-Format:
-{
-    "action": "right_click_text",
-    "target": "text visible on screen"
-}
-
-5. type_text
-Use this when the user wants to type text into whatever currently has
-focus (e.g. a search bar, text field, address bar).
-
-Format:
-{
-    "action": "type_text",
-    "target": "text to type"
-}
-
-6. press_key
-Use this when the user wants to press a single key or key combo
-(e.g. enter, escape, ctrl+s, alt+tab).
-
-Format:
-{
-    "action": "press_key",
-    "target": "key or combo"
-}
-
-7. wait
-Use this when the user wants to pause before the next step, or when a
-multi-step request implies a short delay is needed (e.g. after opening
-an app, before clicking something in it).
-
-Format:
-{
-    "action": "wait",
-    "target": <number of seconds>
-}
-
-8. close_app
-Use this when the user wants to close, quit, exit, or shut down an app or
-window (e.g. "close brave", "close it", "close this window", "quit
-spotify", "shut spotify down").
-
-If the user names an app, use it as the target. If they just say "it",
-"this", "that", or "this window" — meaning whatever the agent is currently
-focused on — set the target to an empty string "".
-
-Format:
-{
-    "action": "close_app",
-    "target": "application name (or \"\" for the current window)"
-}
-
-CRITICAL RULE: closing a browser TAB is NOT close_app. "close the tab",
-"close this tab", "close tab" is press_key with target "ctrl+w". Use
-close_app only to close a whole window or application.
-
-CRITICAL RULE: clicking an "X", "cross mark", "close button", or "close
-icon" is a CLOSE intent — the X is a picture the agent cannot read as
-text, so never use click_text for it. Use close_app to close a window, or
-press_key "ctrl+w" to close a tab.
-
-9. scroll
-Use this when the user wants to scroll the current window up or down
-(e.g. "scroll down", "scroll up", "go down a bit").
-
-Format:
-{
-    "action": "scroll",
-    "target": "up" or "down"
-}
-
-10. screenshot
-Use this when the user wants to take/capture a screenshot of the screen.
-
-Format:
-{
-    "action": "screenshot",
-    "target": ""
-}
-
-11. get_color
-Use this when the user asks what COLOR something is — either the color
-under the mouse cursor, or the color of a named on-screen element.
-
-If they ask about "this", "here", or the cursor, set target to "". If they
-name an element ("what color is the login button"), put its text in target.
-
-Format:
-{
-    "action": "get_color",
-    "target": "" or "element text"
-}
-
-12. switch_app_picker
-Use this when the user asks to switch apps, switch tabs in the Windows
-three-finger gesture sense, show open apps, or open Task View. The agent will
-ask which app to focus next.
-
-Format:
-{
-    "action": "switch_app_picker",
-    "target": ""
-}
-
-MEDIA & VOLUME: media playback and system volume are done with press_key
-using the special media keys. Map them like this:
-- play / pause / resume        -> press_key "playpause"
-- next song / skip / next track-> press_key "nexttrack"
-- previous song / last track   -> press_key "prevtrack"
-- volume up / louder           -> press_key "volumeup"
-- volume down / quieter        -> press_key "volumedown"
-- mute / unmute                -> press_key "volumemute"
-
-SPOTIFY SEARCH/PLAY: Spotify has its own in-app search. Do NOT invent a
-"search" action. If the user asks to search for or play a named song/artist in
-Spotify, use a sequence: focus or open Spotify, wait if opened, press_key
-"ctrl+l", type_text the query, press_key "enter", wait 1, press_key "enter".
-
-MULTI-STEP REQUESTS: If the user asks for several actions in one sentence
-(e.g. "open brave, go to youtube and search for cats", "open notepad and type
-hello then save"), do NOT pick just one — output an ordered SEQUENCE instead of
-a single action:
-
-{
-    "steps": [
-        {"action": "...", "target": "..."},
-        {"action": "...", "target": "..."}
-    ]
-}
-
-Each step is one of the single actions listed above. Rules for good sequences:
-- List the steps in the order the user said them.
-- After open_app (launching a program), add {"action":"wait","target":2} before
-  you click/type/press inside it — the window needs a moment to appear.
-- To go to a website in a browser, focus the address bar first with
-  {"action":"press_key","target":"ctrl+l"}, then type_text the URL, then
-  press_key "enter".
-- If the request is really just ONE action, use the single-action form, NOT steps.
-
-Rules:
-- Return ONLY valid JSON.
-- Do NOT return Markdown.
-- Do NOT return Python code.
-- Do NOT explain your reasoning.
-- Do NOT invent actions.
-- Use the user's wording as the target, stripped of filler words.
-- Ignore capitalization differences.
-- For "wait", target must be a plain number (e.g. 1, 2, 0.5), not a string.
-
-Examples:
-
-User: open brave
-Output:
-{"action":"open_app","target":"brave"}
-
-User: launch VS Code
-Output:
-{"action":"open_app","target":"vs code"}
-
-User: start spotify
-Output:
-{"action":"open_app","target":"spotify"}
-
-User: open my downloads folder
-Output:
-{"action":"open_folder","target":"downloads"}
-
-User: hey morning can you open download folder for me
-Output:
-{"action":"open_folder","target":"downloads"}
-
-User: open desktop
-Output:
-{"action":"open_folder","target":"desktop"}
-
-User: show me my documents
-Output:
-{"action":"open_folder","target":"documents"}
-
-User: move your focus to brave
-Output:
-{"action":"focus_app","target":"brave"}
-
-User: switch to spotify
-Output:
-{"action":"focus_app","target":"spotify"}
-
-User: click the search bar
-Output:
-{"action":"click_text","target":"search"}
-
-User: click on submit
-Output:
-{"action":"click_text","target":"submit"}
-
-User: right-click on search
-Output:
-{"action":"right_click_text","target":"search"}
-
-User: type youtube.com
-Output:
-{"action":"type_text","target":"youtube.com"}
-
-User: press enter
-Output:
-{"action":"press_key","target":"enter"}
-
-User: save the file
-Output:
-{"action":"press_key","target":"ctrl+s"}
-
-User: go back
-Output:
-{"action":"press_key","target":"alt+left"}
-
-User: come back
-Output:
-{"action":"press_key","target":"alt+left"}
-
-User: go back to the previous page
-Output:
-{"action":"press_key","target":"alt+left"}
-
-User: focus the address bar
-Output:
-{"action":"press_key","target":"ctrl+l"}
-
-User: scroll down
-Output:
-{"action":"scroll","target":"down"}
-
-User: scroll up a bit
-Output:
-{"action":"scroll","target":"up"}
-
-User: take a screenshot
-Output:
-{"action":"screenshot","target":""}
-
-User: what color is this
-Output:
-{"action":"get_color","target":""}
-
-User: what colour is the login button
-Output:
-{"action":"get_color","target":"login"}
-
-User: click the red submit button
-Output:
-{"action":"click_text","target":"red submit"}
-
-User: click the green one
-Output:
-{"action":"click_text","target":"green one"}
-
-User: play the song
-Output:
-{"action":"press_key","target":"playpause"}
-
-User: turn the volume up
-Output:
-{"action":"press_key","target":"volumeup"}
-
-User: mute it
-Output:
-{"action":"press_key","target":"volumemute"}
-
-User: skip this song
-Output:
-{"action":"press_key","target":"nexttrack"}
-
-User: wait 2 seconds
-Output:
-{"action":"wait","target":2}
-
-User: close brave
-Output:
-{"action":"close_app","target":"brave"}
-
-User: quit spotify
-Output:
-{"action":"close_app","target":"spotify"}
-
-User: close it
-Output:
-{"action":"close_app","target":""}
-
-User: close this window
-Output:
-{"action":"close_app","target":""}
-
-User: close the tab
-Output:
-{"action":"press_key","target":"ctrl+w"}
-
-User: close this tab
-Output:
-{"action":"press_key","target":"ctrl+w"}
-
-User: click the X to close it
-Output:
-{"action":"close_app","target":""}
-
-User: open notepad and type hello world then save
-Output:
-{"steps":[{"action":"open_app","target":"notepad"},{"action":"wait","target":2},{"action":"type_text","target":"hello world"},{"action":"press_key","target":"ctrl+s"}]}
-
-User: open brave, go to youtube and search for cat videos
-Output:
-{"steps":[{"action":"open_app","target":"brave"},{"action":"wait","target":2},{"action":"press_key","target":"ctrl+l"},{"action":"type_text","target":"youtube.com"},{"action":"press_key","target":"enter"},{"action":"wait","target":2},{"action":"type_text","target":"cat videos"},{"action":"press_key","target":"enter"}]}
-
-User: open spotify and play famous
-Output:
-{"steps":[{"action":"open_app","target":"spotify"},{"action":"wait","target":2},{"action":"press_key","target":"ctrl+l"},{"action":"type_text","target":"famous"},{"action":"press_key","target":"enter"},{"action":"wait","target":1},{"action":"press_key","target":"enter"}]}
-
-User: search famous in spotify
-Output:
-{"steps":[{"action":"focus_app","target":"spotify"},{"action":"press_key","target":"ctrl+l"},{"action":"type_text","target":"famous"},{"action":"press_key","target":"enter"},{"action":"wait","target":1},{"action":"press_key","target":"enter"}]}
+"""
+agent.py
+
+Entrypoint for the personal desktop agent.
+Orchestrates text mode, voice mode, and the command pipeline.
 """
 
+import argparse
+import sys
+import json
+import re
 
-ALLOWED_ACTIONS = {
-    "open_app",
-    "open_folder",
-    "focus_app",
-    "close_app",
-    "click_text",
-    "right_click_text",
-    "type_text",
-    "press_key",
-    "scroll",
-    "screenshot",
-    "get_color",
-    "wait",
-    "switch_app_picker",
-}
+try:
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+except Exception:
+    pass
 
+import action_registry
+import config
+import context_memory
+import aliases as _aliases_mod
+import confirmation
+import disambiguation
+import cancel_token
+import trainer
+import intent_resolver
+import action_runner
 
-# Upper bound on how many steps a single multi-step request may expand into.
-# A guard against a runaway plan (a confused model emitting dozens of steps),
-# not a limit anyone should hit in normal use — real chained commands are a
-# handful of steps.
-MAX_STEPS = 12
-
-
-def normalize_action(parsed):
-    """Canonicalize whatever a source (LLM / cache / builtin) produced into one
-    of two shapes: a single-action dict, or a composite sequence
-    {"action": "sequence", "steps": [ ...actions... ]}.
-
-    Accepts the several forms the model might emit for a multi-step plan and
-    folds them together so the rest of the pipeline only ever sees those two
-    shapes:
-        {"steps": [A, B, ...]}   ->  {"action":"sequence","steps":[A, B, ...]}
-        [A, B, ...]              ->  {"action":"sequence","steps":[A, B, ...]}
-        {"steps": [A]} / [A]     ->  A          (a one-item plan is just A)
-        A single action dict     ->  A          (unchanged — the common case)
-
-    Unwrapping a one-item plan is deliberate: it keeps a trivial "sequence" from
-    taking the multi-step execution path, so single-action behaviour is
-    byte-for-byte what it was before this feature. Idempotent — a value already
-    in canonical form is returned unchanged."""
-    # {"steps": [...]} wrapper -> the list inside it.
-    if isinstance(parsed, dict) and "steps" in parsed and "action" not in parsed:
-        parsed = parsed.get("steps")
-
-    if isinstance(parsed, list):
-        steps = parsed
-        if len(steps) == 1:
-            return steps[0]                       # one-item plan == that action
-        return {"action": "sequence", "steps": steps}
-
-    # Already a single action dict (or an already-normalized sequence, or
-    # something malformed that validate_action will reject) — leave as-is.
-    return parsed
-
-
-def is_sequence(action) -> bool:
-    """True if this action is a multi-step sequence (executed step-by-step by
-    _run_sequence, never handed to execute_action as a whole)."""
-    return isinstance(action, dict) and action.get("action") == "sequence"
-
-
-def ask_qwen(user_input):
-    kwargs = dict(
-        model=MODEL,
-        messages=[
-            {
-                "role": "system",
-                "content": SYSTEM_PROMPT,
-            },
-            {
-                "role": "user",
-                "content": user_input,
-            },
-        ],
-        format="json",  # Hard constraint at the decoding level — Ollama
-                        # will not let the model generate anything except
-                        # a valid JSON object. This is what actually stops
-                        # the "let's see, the user said..." reasoning text,
-                        # regardless of whether think=False is honored.
-        keep_alive="30m",  # Keep the model resident between commands so we
-                           # don't pay the cold model-load latency (several
-                           # seconds) on every request. Ollama otherwise
-                           # unloads an idle model after ~5 minutes.
-        options={
-            "temperature": 0,   # deterministic — we want consistent JSON, not creativity
-            "num_predict": 512,  # room for a multi-step {"steps":[...]} plan. A single
-                                 # action still stops early (format="json" ends at the
-                                 # closing brace), so this doesn't slow the common case;
-                                 # it only stops multi-step output from being truncated
-                                 # mid-plan (which would fail JSON parsing). Was 80.
-            "num_ctx": 4096,    # Cap the context window. qwen3 otherwise defaults to a huge
-                                # (~128K) window, and Ollama pre-allocates a KV cache for the
-                                # full size at load — ~35 GB, which OOMs and the model never
-                                # loads (so no action ever runs). Our system prompt + a short
-                                # command fit comfortably in 4K.
-        },
-    )
-
-    try:
-        # Belt-and-suspenders: also try to skip the internal reasoning pass
-        # on models/versions that support it directly, for extra speed.
-        response = ollama.chat(think=False, **kwargs)
-    except TypeError:
-        # Installed ollama package is too old to accept `think=`.
-        # format="json" + the Modelfile's baked-in /no_think still do the
-        # heavy lifting either way.
-        response = ollama.chat(**kwargs)
-
-    message = response["message"]
-
-    # On updated Ollama versions, reasoning text (if any slips through)
-    # arrives in a separate `thinking` field, not mixed into `content`.
-    # Log it for visibility but never treat it as part of the answer.
-    thinking = message.get("thinking")
-    if thinking:
-        print(f"(thinking: {thinking[:120]}{'...' if len(thinking) > 120 else ''})")
-
-    return message["content"].strip()
-
-
-def validate_action(action):
-    """
-    Make sure Qwen returned an action that our agent actually supports.
-    """
-
-    if not isinstance(action, dict):
-        return False, "Action must be a JSON object."
-
-    action_type = action.get("action")
-
-    # A multi-step sequence: validate the wrapper here (length + each step),
-    # BEFORE the single-action ALLOWED_ACTIONS check below — "sequence" is
-    # deliberately NOT in ALLOWED_ACTIONS, so a step that is itself a "sequence"
-    # is rejected by the recursive call (no nesting).
-    if action_type == "sequence":
-        steps = action.get("steps")
-        if not isinstance(steps, list):
-            return False, "A sequence needs a list of steps."
-        if len(steps) < 2:
-            # A 0/1-step "sequence" shouldn't exist post-normalization; if one
-            # slips through, it's malformed rather than a real multi-step plan.
-            return False, "A sequence needs at least two steps."
-        if len(steps) > MAX_STEPS:
-            return False, f"Too many steps ({len(steps)}); the limit is {MAX_STEPS}."
-        for i, step in enumerate(steps, 1):
-            if not isinstance(step, dict):
-                return False, f"Step {i} must be an action object."
-            if step.get("action") == "sequence":
-                return False, "A sequence can't contain another sequence."
-            ok, err = validate_action(step)
-            if not ok:
-                return False, f"Step {i} ({step.get('action')}): {err}"
-        return True, None
-
-    if action_type not in ALLOWED_ACTIONS:
-        return False, f"Action '{action_type}' is not allowed."
-
-    if action_type in ("open_app", "open_folder", "focus_app", "click_text", "right_click_text", "type_text", "press_key", "scroll"):
-        target = action.get("target")
-
-        if not isinstance(target, str) or not target.strip():
-            return False, "Target is missing."
-
-    if action_type == "screenshot":
-        # Target is optional (an output filename). If present, it must be text.
-        target = action.get("target")
-
-        if target is not None and not isinstance(target, str):
-            return False, "Screenshot target must be text."
-
-    if action_type == "get_color":
-        # Target is optional: empty means "the color under the cursor". If a
-        # target is given (an element to read), it must be text.
-        target = action.get("target")
-
-        if target is not None and not isinstance(target, str):
-            return False, "Color target must be text."
-
-    if action_type == "close_app":
-        # Target is optional here: an empty target (or a pronoun like "it")
-        # means "close the currently-focused app". If a target is given
-        # though, it must be text.
-        target = action.get("target")
-
-        if target is not None and not isinstance(target, str):
-            return False, "Close target must be text."
-
-    if action_type == "wait":
-        target = action.get("target")
-
-        if isinstance(target, bool):
-            return False, "Wait target must be a number of seconds."
-
-        if isinstance(target, str):
-            # Qwen sometimes emits numbers as JSON strings (e.g. "2"
-            # instead of 2) — accept that as long as it actually parses.
-            try:
-                target = float(target)
-            except ValueError:
-                return False, "Wait target must be a number of seconds."
-        elif not isinstance(target, (int, float)):
-            return False, "Wait target must be a number of seconds."
-
-        if target < 0:
-            return False, "Wait target must be non-negative."
-
-    if action_type == "switch_app_picker":
-        target = action.get("target")
-
-        if target is not None and not isinstance(target, str):
-            return False, "Switch-app target must be text."
-
-    return True, None
-
+# Load plugins and dynamically generate the allowed set
+action_registry.load_plugins("plugins")
 
 EXIT_WORDS = {"exit", "quit", "stop", "bye"}
-
-# In VOICE mode "stop" must NOT be treated as an exit word — you can't exit
-# voice mode by voice anyway (it just says so), and "stop"/"stop music" should
-# reach the media builtin. Text mode keeps "stop" as a convenient typed exit.
 VOICE_EXIT_WORDS = {"exit", "quit", "bye", "goodbye"}
-
-
-# --- speech-friendly summaries (voice mode only) ---------------------------
-# In voice mode the reply is spoken aloud, so the verbose per-step aggregation
-# ("Opened brave.; waited 2.0s; pressed 'ctrl+l'; typed 'youtube.com'; pressed
-# 'enter'") is the wrong shape — the user wants a short, natural "here's what
-# I'm doing", not a machine log read back at them. These helpers turn an
-# action/plan into that short spoken form. Text mode never uses them (it keeps
-# the detailed strings, which are useful to read); they're gated behind
-# process_command(..., for_speech=True).
-
-def _brief_single(action: dict, result: str) -> str:
-    """Short spoken version of a single action's result. Text mode never sees
-    this — only voice mode, via process_command(..., for_speech=True)."""
-    kind = action.get("action")
-    target = str(action.get("target") or "").strip()
-    low = (result or "").lower()
-
-    # Informational or failure results carry the actual content the user
-    # needs — never shorten those away.
-    if kind == "get_color":
-        return result
-    if low.startswith(("couldn't", "error", "i don't recognise", "i can only",
-                        "action rejected", "i need a key")):
-        return result
-
-    if kind in ("open_app", "open_folder") and low.startswith(("opened", "launched")):
-        return f"Opened {target}." if target else result
-    if kind == "focus_app" and low.startswith("switched"):
-        return f"Switched to {target}." if target else result
-    if kind == "close_app" and low.startswith("closed"):
-        return result  # already short ("closed brave")
-    if kind == "click_text" and low.startswith("clicked"):
-        return f"Clicked {target}." if target else "Clicked it."
-    if kind == "right_click_text" and low.startswith("right-clicked"):
-        return f"Right-clicked {target}." if target else "Right-clicked it."
-    if kind == "type_text":
-        return "Typed that in."
-    if kind == "press_key":
-        return f"Pressed {target}." if target else result
-    if kind == "scroll":
-        return f"Scrolled {target}." if target else result
-    if kind == "screenshot":
-        return "Saved a screenshot."
-    if kind == "wait":
-        return ""  # nothing worth saying
-
-    return result
-
-
-def _brief_phrases(steps) -> list[str]:
-    """Turn a sequence's steps into a handful of short present-tense phrases,
-    collapsing the ctrl+l -> type_text -> enter navigation pattern into one
-    'going to X' phrase, and dropping mechanical steps (wait, bare enter)."""
-    phrases = []
-    i, n = 0, len(steps)
-    while i < n:
-        step = steps[i]
-        kind = step.get("action")
-        target = str(step.get("target") or "").strip()
-
-        if kind == "open_app":
-            phrases.append(f"opening {target}")
-            i += 1
-        elif kind == "open_folder":
-            phrases.append(f"opening the {target} folder")
-            i += 1
-        elif kind == "focus_app":
-            phrases.append(f"switching to {target}")
-            i += 1
-        elif kind == "close_app":
-            phrases.append(f"closing {target}" if target else "closing that")
-            i += 1
-        elif kind == "press_key" and target.lower() == "ctrl+l" and i + 1 < n \
-                and steps[i + 1].get("action") == "type_text":
-            url = str(steps[i + 1].get("target") or "").strip()
-            phrases.append(f"going to {url}")
-            i += 2
-            if i < n and steps[i].get("action") == "press_key" \
-                    and (steps[i].get("target") or "").lower() == "enter":
-                i += 1
-        elif kind == "type_text":
-            phrases.append(f"searching for {target}" if target else "typing that in")
-            i += 1
-            if i < n and steps[i].get("action") == "press_key" \
-                    and (steps[i].get("target") or "").lower() == "enter":
-                i += 1
-        elif kind == "click_text":
-            phrases.append(f"clicking {target}")
-            i += 1
-        elif kind == "right_click_text":
-            phrases.append(f"right-clicking {target}")
-            i += 1
-        elif kind == "scroll":
-            phrases.append(f"scrolling {target}")
-            i += 1
-        elif kind == "screenshot":
-            phrases.append("taking a screenshot")
-            i += 1
-        else:
-            i += 1  # wait, lone press_key, get_color etc. — not worth narrating
-
-    return phrases
-
-
-def _brief_sequence(steps) -> str:
-    """One short spoken line summarising a whole plan:
-    'Opening brave, then going to youtube.com.'"""
-    phrases = _brief_phrases(steps)
-    if not phrases:
-        return "Done."
-    text = ", then ".join(phrases)
-    return text[0].upper() + text[1:] + "."
-
-
-def _run_sequence(steps, _prefix=None, for_speech=False):
-    """Execute a multi-step plan in order, one step at a time, and return a
-    single aggregated reply string.
-
-    for_speech only changes the RETURNED text (a short spoken summary via
-    _brief_sequence), never what runs — every step still executes exactly as it
-    does in text mode.
-
-    Each step goes through the ordinary single-action execute_action, so every
-    step behaves exactly as it would as a standalone command. Two things make
-    this more than a for-loop:
-
-      * Ambiguous click ("ask & resume"): if a click step finds 2+ rival matches
-        it comes back as an AmbiguousClick. We arm the disambiguation gate with
-        the REMAINING steps as its resume tail and return the numbered prompt.
-        The user's pick (handled at the top of process_command) clicks the chosen
-        match and then calls _run_sequence again on that tail — so the rest of the
-        plan continues after the pick, and a later ambiguous click simply re-arms.
-
-      * _prefix carries the result lines of steps that already ran in an earlier
-        turn (e.g. the resolved click), so the resumed reply reads as one whole.
-
-    Destructive steps are NOT re-confirmed here: a sequence containing any
-    destructive step is confirmed as a whole batch up front (see
-    process_command), so by the time we run the steps the user has already said
-    yes to all of them."""
-    results = list(_prefix or [])
-    for i, step in enumerate(steps):
-        print("⚙️ Executing (step):", step)
-        result = execute_action(step)
-
-        if isinstance(result, disambiguation.AmbiguousClick):
-            # Suspend the plan: ask which match, and stash everything AFTER this
-            # click so the pick can resume from there.
-            disambiguation.arm(result, resume_steps=steps[i + 1:])
-            prompt = disambiguation.prompt_for(result)
-            if for_speech:
-                # Speak a short "here's what I've done so far" before the pick
-                # prompt (which itself must stay verbose — it lists the options).
-                lead_bits = list(_prefix or [])
-                if i:
-                    lead_bits.append(_brief_sequence(steps[:i]))
-                lead = " ".join(b for b in lead_bits if b).strip()
-                return (lead + " " + prompt).strip() if lead else prompt
-            if results:
-                return "Done so far: " + "; ".join(results) + ". " + prompt
-            return prompt
-
-        results.append(str(result))
-
-    if for_speech:
-        # Every step ran above; now speak the short natural summary instead of
-        # the per-step log. _prefix holds already-spoken lines from a resumed
-        # click, so keep those and append the tail's summary.
-        summary = _brief_sequence(steps)
-        return (" ".join(_prefix) + " " + summary).strip() if _prefix else summary
-
-    return "; ".join(results)
-
-
-def _dispatch(action, for_speech=False):
-    """Run a resolved action and return a reply string, handling both shapes:
-    a multi-step sequence (via _run_sequence) or a single action (via
-    execute_action, arming the disambiguation gate if the click is ambiguous).
-
-    For a single action this reproduces the old inline main-path behaviour
-    exactly, so nothing about single commands changes. for_speech only swaps the
-    RETURNED text for a short spoken form (via _brief_single) — never what runs."""
-    if is_sequence(action):
-        return _run_sequence(action["steps"], for_speech=for_speech)
-
-    result = execute_action(action)
-    if isinstance(result, disambiguation.AmbiguousClick):
-        disambiguation.arm(result)
-        return disambiguation.prompt_for(result)
-    return _brief_single(action, result) if for_speech else result
-
 
 def process_command(user_input: str, write_pet_state=None, for_speech: bool = False) -> str:
     """
-    Run one command through the full pipeline (cache -> Qwen -> validate
-    -> execute) and return a plain-text result string.
-
-    write_pet_state, if given, is called at each stage (e.g. "thinking",
-    "idle") so callers can drive the pet UI's animation. Text mode and
-    voice mode both call this — it's the one place the actual agent
-    logic lives, so neither mode can drift out of sync with the other.
-
-    for_speech=True (voice mode) returns a short, natural spoken summary of
-    what ran instead of the detailed per-step string; it never changes which
-    actions execute, only the words that come back to be read aloud. Text mode
-    leaves it False and keeps the detailed reply.
+    Run one command through the full pipeline:
+    Interactive Gates -> Intent Resolver -> Action Runner
     """
-
     def _pet(state):
         if write_pet_state:
             write_pet_state(state)
 
     try:
+        cancel_token.GLOBAL_TOKEN.reset()
         _pet("thinking")
 
-        # Ignore blank / punctuation-only input before anything else. A bare
-        # wake word transcribed as "agent." leaves just ".", which normalizes
-        # to the empty string — never run that through builtins, the cache, or
-        # Qwen (an empty prompt sent to Qwen is how a bogus "" -> open brave
-        # cache entry got born in the first place). Any pending confirmation or
-        # disambiguation stays armed: an empty utterance is neither a yes/no
-        # nor a pick, so we simply don't consume it.
-        if not normalize_prompt(user_input):
-            _pet("idle")
-            return "I didn't catch that."
-
-        # 0a. If Task View is open from "switch tabs/apps", the next utterance
-        # is the app name to focus. Let bare "brave" or "spotify" work here.
-        if app_switch.is_pending():
-            choice = app_switch.interpret(user_input)
-            if choice == "cancel":
-                app_switch.clear()
-                _pet("idle")
-                return "Okay, cancelled."
-            if choice != "unrelated":
-                app_switch.clear()
-                action = {"action": "focus_app", "target": choice}
-                print("⚙️ Executing (app choice):", action)
-                result = _dispatch(action, for_speech=for_speech)
-                _pet("idle")
-                return result
-
-        # 0. If a destructive action is armed and waiting for confirmation,
-        #    THIS input is the yes/no answer — interpret it here, before the
-        #    classifier ever sees it (so "yes"/"no" never get sent to Qwen or
-        #    saved to the prompt cache as if they were commands).
-        if confirmation.is_pending():
-            decision = confirmation.interpret(user_input)
-            if decision == "confirm":
-                action = confirmation.take()
-                print("⚙️ Executing (confirmed):", action)
-                result = _dispatch(action, for_speech=for_speech)
-                _pet("idle")
-                return result + confirmation.recovery_hint(action)
-            if decision == "cancel":
-                action = confirmation.pending_action()
-                confirmation.clear()
-                _pet("idle")
-                return (f"Okay, I won't {confirmation.describe(action)}."
-                        if action else "Okay, cancelled.")
-            # "unrelated": the user said something that isn't a yes/no — drop
-            # the stale pending action (better than holding a loaded close) and
-            # fall through to handle this input as a brand-new command.
-            confirmation.clear()
-
-        # 0b. If a click is awaiting disambiguation, THIS input is the pick (a
-        #     number / position / color). Resolve it here, before the classifier,
-        #     so a selection word like "two" or "top" can never collide with a
-        #     builtin command or be sent to Qwen.
-        if disambiguation.is_pending():
-            ambig = disambiguation.pending()
-
-            # --- stage 2: cursor is already pointing at a candidate ---
-            # Wait for yes/no before actually clicking.
-            if disambiguation.is_confirming_preview():
-                decision = disambiguation.interpret_preview_confirmation(user_input)
-                if decision == "confirm":
-                    idx = disambiguation.pending_preview_index()
-                    cand = ambig.candidates[idx]
-                    resume_steps = disambiguation.pending_resume_steps()
-                    disambiguation.clear()
-                    action = {"action": "click_at", "x": cand["x"], "y": cand["y"],
-                              "label": disambiguation.describe_choice(ambig, idx),
-                              "button": cand.get("button", "left")}
-                    print("⚙️ Executing (preview confirmed):", action)
-                    result = execute_action(action)
-                    if for_speech:
-                        result = "Right-clicked that." if action.get("button") == "right" else "Clicked that."
-                    if resume_steps:
-                        result = _run_sequence(resume_steps, _prefix=[str(result)],
-                                               for_speech=for_speech)
+        # 1. Training / Correction interception
+        correction_target = trainer.extract_correction_phrase(user_input)
+        if correction_target:
+            last_prompt, last_act, _ = trainer.get_last_turn()
+            if last_prompt:
+                # Bypass standard resolution for correction target to get the raw action
+                corr_act, err, _ = intent_resolver.resolve(correction_target)
+                if corr_act:
+                    learn_msg = trainer.apply_correction(last_prompt, corr_act, wrong_action=last_act)
+                    print(f"✅ {learn_msg}")
+                    exec_result = action_runner.run(corr_act, for_speech=for_speech)
                     _pet("idle")
-                    return result
-                if decision == "reject":
-                    # User said no / wrong one — go back to the numbered list.
-                    disambiguation.clear_preview()
-                    _pet("idle")
-                    return ("Okay, let me show you the options again. "
-                            + disambiguation.prompt_for(ambig))
-                if decision == "cancel":
-                    disambiguation.clear()
-                    _pet("idle")
-                    return "Okay, cancelled."
-                # Unrecognised response — re-prompt for yes/no.
-                _pet("idle")
-                return ("Please say yes to click it, no to go back to the list, "
-                        "or cancel to stop.")
+                    trainer.record_turn(user_input, corr_act, exec_result)
+                    return f"{learn_msg}. {exec_result}"
 
-            # --- stage 1: user names a candidate; move cursor there and ask. ---
-            choice = disambiguation.interpret(user_input, ambig.candidates)
-            if isinstance(choice, int):
-                cand = ambig.candidates[choice]
-                # Move the cursor to that spot without clicking yet.
-                move_action = {"action": "move_to", "x": cand["x"], "y": cand["y"],
-                               "label": disambiguation.describe_choice(ambig, choice)}
-                print("⚙️ Executing (preview move):", move_action)
-                execute_action(move_action)
-                # Remember which candidate is being previewed so stage 2 knows.
-                disambiguation.preview(choice)
-                _pet("idle")
-                return disambiguation.confirm_prompt(ambig, choice)
-            if choice == "cancel":
-                disambiguation.clear()
-                _pet("idle")
-                return "Okay, cancelled."
-            # Not a valid pick. Keep the pending selection alive and ask again
-            # instead of sending the user's correction to Qwen/terminal flow.
+        # 2. Check Interactive Gates
+        gate_result = action_runner.handle_pending_gates(user_input, for_speech=for_speech, write_pet_state=write_pet_state)
+        if gate_result is not None:
+            return gate_result
+
+        # 3. Resolve Intent
+        action, error, from_llm = intent_resolver.resolve(user_input)
+        if error:
             _pet("idle")
-            return ("I didn't catch which one. "
-                    + disambiguation.prompt_for(ambig))
+            return error
 
-        # 1. Curated builtins first — instant and deterministic (no LLM, no
-        #    cache-file read). Covers the hottest commands: scroll, volume,
-        #    media, copy/paste, new tab, and so on.
-        action = get_builtin_action(user_input)
-        from_builtin = action is not None
-        from_smart_builtin = False
-
-        if not from_builtin:
-            action = get_smart_builtin_action(user_input)
-            from_smart_builtin = action is not None
-
-        # 2. Then the learned prompt cache — skip Qwen if we've classified
-        #    this exact phrasing before.
-        if not from_builtin and not from_smart_builtin:
-            action = get_cached_action(user_input)
-        was_cached = (not from_builtin and not from_smart_builtin) and action is not None
-
-        if from_builtin:
-            print("⚡ Built-in command (no LLM call)")
-        elif from_smart_builtin:
-            print("⚡ Smart built-in command (no LLM call)")
-        elif was_cached:
-            print("⚡ Using cached response (no LLM call)")
-        else:
-            raw_response = ask_qwen(user_input)
-
-            print("Qwen:", raw_response)
-
-            # Defensive cleanup: strip <think> blocks / markdown fences,
-            # then pull out just the JSON value — belt-and-suspenders in case
-            # any reasoning prose sneaks in around it despite format="json".
-            cleaned = re.sub(r"<think>.*?</think>", "", raw_response, flags=re.DOTALL)
-            cleaned = cleaned.replace("```json", "").replace("```", "").strip()
-
-            # It's normally a single {...} object, but a multi-step plan can
-            # arrive as a top-level [...] array — branch on the leading char. A
-            # greedy \{.*\} would otherwise swallow an array's inner objects and
-            # drop the surrounding brackets, yielding invalid JSON.
-            if cleaned.startswith("["):
-                json_match = re.search(r"\[.*\]", cleaned, flags=re.DOTALL)
-            else:
-                json_match = re.search(r"\{.*\}", cleaned, flags=re.DOTALL)
-            if not json_match:
-                raise json.JSONDecodeError("No JSON value found", cleaned, 0)
-
-            action = json.loads(json_match.group(0))
-
-        # Fold whatever the source produced (single dict, {"steps":[...]}, or a
-        # bare [...] list) into our two canonical shapes: a single action, or a
-        # {"action":"sequence","steps":[...]} composite. Idempotent, so a cached
-        # sequence or a builtin single action passes straight through.
-        action = normalize_action(action)
-
-        valid, error = validate_action(action)
-
-        if not valid:
-            _pet("idle")
-            return f"Action rejected: {error}"
-
-        # 3. Only cache a freshly LLM-classified, validated action — never
-        #    re-save a cache hit (it bumped its own hit_count already), and
-        #    never persist a builtin (the builtin table already catches it,
-        #    faster than the cache would).
-        if not from_builtin and not from_smart_builtin and not was_cached:
-            save_action(user_input, action)
-
-        # 4. Destructive actions (close a window/tab/app) don't run on the
-        #    spot — a misheard command could kill an app in under a second.
-        #    Arm it here and ask for a yes/no; the NEXT command resolves it
-        #    (see the pending-confirmation check at the top of this function).
-        #    Gating here — after every source has produced its action —
-        #    covers builtins, cache hits, and the LLM alike.
+        # 4. Final Confirmation Gate
         if confirmation.needs_confirmation(action):
             confirmation.arm(action)
             _pet("idle")
             return confirmation.prompt_for(action)
 
-        print("⚙️ Executing:", action)
-
-        # Dispatch through the runner: a single action executes exactly as
-        # before; a sequence runs step-by-step. Both arm the disambiguation gate
-        # on an ambiguous click (a mid-sequence click also stashes its resume
-        # tail), keeping this function's return type a plain string for every
-        # caller.
-        result = _dispatch(action, for_speech=for_speech)
-
-        if action.get("action") == "switch_app_picker":
-            app_switch.arm()
-            _pet("idle")
-            return "Which app do you want to open?"
-
+        # 5. Run Action
+        result = action_runner.run(action, for_speech=for_speech)
+        trainer.record_turn(user_input, action, result)
         _pet("idle")
         return result
 
-    except json.JSONDecodeError:
-        _pet("idle")
-        return "Sorry, I didn't understand that."
-
     except Exception as e:
+        import traceback
+        traceback.print_exc()
         _pet("idle")
         return f"Error: {e}"
 
@@ -1078,31 +94,77 @@ def run_text_mode():
     print("=" * 50)
     print("🤖 Personal Agent")
     print("=" * 50)
-    print("Model:", MODEL)
-    print("Type 'exit' or 'quit' to stop.\n")
+    print("Model:", intent_resolver.MODEL)
+    print("Type 'exit' or 'quit' to stop.\\n")
 
     while True:
-
         user_input = input("You: ").strip()
-
         if not user_input:
             continue
 
-        # Control commands bypass the LLM entirely — there's no reason to
-        # send "quit" to Qwen and wait for a JSON classification of it.
-        # ...but not while a destructive action is awaiting yes/no, or a click
-        # is awaiting a pick: there, "stop" means "cancel that", not "exit the
-        # agent", so let it through to process_command's handlers.
         if (user_input.lower() in EXIT_WORDS
                 and not confirmation.is_pending()
                 and not disambiguation.is_pending()):
             print("Agent stopped.")
             break
 
-        # "forget <phrase>" clears a bad cached classification, in case
-        # Qwen got something wrong once and we don't want it repeated.
+        if intent_resolver.normalize_prompt(user_input) in {
+            "what do you remember", "show memory", "memory", "recall",
+            "what do you know", "what have you remembered",
+        }:
+            print("🤖 Agent:", context_memory.summary())
+            print()
+            continue
+
         if user_input.lower().startswith("forget "):
+            from prompt_cache import forget_prompt
             forget_prompt(user_input[7:].strip())
+            print()
+            continue
+
+        if intent_resolver.normalize_prompt(user_input) in {
+            "list aliases", "show aliases", "my aliases", "aliases",
+            "list shortcuts", "show shortcuts",
+        }:
+            print("🤖 Agent:", _aliases_mod.format_alias_list())
+            print()
+            continue
+
+        if user_input.lower().startswith("alias "):
+            alias_name = user_input[6:].strip()
+            if not alias_name:
+                print("🤖 Agent: Give me a name — e.g. 'alias my work folder'")
+            else:
+                last = context_memory.get("last_action")
+                if last is None:
+                    print("🤖 Agent: I haven't done anything yet — run a command first.")
+                else:
+                    _aliases_mod.save_alias(alias_name, last)
+                    print(f"🤖 Agent: Saved alias '{alias_name}'.")
+            print()
+            continue
+
+        if intent_resolver.normalize_prompt(user_input).startswith("forget alias "):
+            alias_name = user_input[len("forget alias "):].strip()
+            if _aliases_mod.delete_alias(alias_name):
+                print(f"🤖 Agent: Removed alias '{alias_name}'.")
+            else:
+                print(f"🤖 Agent: No alias called '{alias_name}' found.")
+            print()
+            continue
+
+        lower_ui = user_input.lower()
+        if lower_ui.startswith("rename alias ") and " to " in lower_ui:
+            rest = user_input[len("rename alias "):]
+            parts = rest.split(" to ", 1)
+            if len(parts) == 2:
+                old_name, new_name = parts[0].strip(), parts[1].strip()
+                if _aliases_mod.rename_alias(old_name, new_name):
+                    print(f"🤖 Agent: Renamed '{old_name}' → '{new_name}'.")
+                else:
+                    print(f"🤖 Agent: No alias called '{old_name}' found.")
+            else:
+                print("🤖 Agent: Usage: rename alias <old name> to <new name>")
             print()
             continue
 
@@ -1112,55 +174,71 @@ def run_text_mode():
 
 
 def run_voice_mode():
-    # Imported lazily so text-mode users don't need voice deps installed
-    # (speech_recognition / faster-whisper / pyttsx3 / pyaudio) just to
-    # run the agent by keyboard.
     import voice_io
 
     print("=" * 50)
     print("🤖 Personal Agent — voice mode")
     print("=" * 50)
-    print("Model:", MODEL)
-    print(f"Say '{voice_io.WAKE_WORD}' to give a command. Ctrl+C to stop.\n")
+    print("Model:", intent_resolver.MODEL)
+    print(f"Say '{voice_io.WAKE_WORD}' to give a command. Ctrl+C to stop.\\n")
 
     def _pet_state(state):
         voice_io._write_state(state)
 
     def on_command(command_text: str) -> str:
-        # If a destructive action is armed (yes/no) or a click is awaiting a
-        # pick, this utterance is the answer — route it straight to the
-        # pipeline's handlers, ahead of the exit/forget shortcuts, so
-        # "stop"/"forget it" here read as "cancel that" rather than "exit voice
-        # mode" / "forget a cached prompt".
         if confirmation.is_pending() or disambiguation.is_pending():
-            return process_command(command_text, write_pet_state=_pet_state,
-                                   for_speech=True)
+            return process_command(command_text, write_pet_state=_pet_state, for_speech=True)
 
         if command_text.lower().strip() in VOICE_EXIT_WORDS:
-            # Voice mode doesn't have a clean way to break its own loop
-            # from in here; just let it keep listening but say goodbye.
             return "Okay, but I'm still listening — close this window to fully stop."
 
         if command_text.lower().startswith("forget "):
+            from prompt_cache import forget_prompt
             forget_prompt(command_text[7:].strip())
             return "Forgotten."
 
-        return process_command(command_text, write_pet_state=_pet_state,
-                               for_speech=True)
+        if intent_resolver.normalize_prompt(command_text) in {
+            "what do you remember", "show memory", "memory", "recall",
+            "what do you know", "what have you remembered",
+        }:
+            return context_memory.summary()
+
+        if command_text.lower().startswith("alias "):
+            alias_name = command_text[6:].strip()
+            if not alias_name:
+                return "Tell me a name for the alias."
+            last = context_memory.get("last_action")
+            if last is None:
+                return "I haven't done anything yet — run a command first."
+            _aliases_mod.save_alias(alias_name, last)
+            return f"Saved alias {alias_name}."
+
+        if intent_resolver.normalize_prompt(command_text).startswith("forget alias "):
+            alias_name = command_text[len("forget alias "):].strip()
+            if _aliases_mod.delete_alias(alias_name):
+                return f"Removed alias {alias_name}."
+            return f"I don't have an alias called {alias_name}."
+
+        if intent_resolver.normalize_prompt(command_text) in {
+            "list aliases", "show aliases", "my aliases", "aliases",
+            "list shortcuts", "show shortcuts",
+        }:
+            rows = _aliases_mod.list_aliases()
+            if not rows:
+                return "No aliases saved yet."
+            names = ", ".join(r["name"] for r in rows)
+            return f"You have {len(rows)} alias{'es' if len(rows) != 1 else ''}: {names}."
+
+        return process_command(command_text, for_speech=True)
 
     voice_io.voice_loop(on_command)
 
 
-def _launch_video_pet():
-    """Start the looping corner video pet (video_pet.py) as a background
-    process. Best-effort: the agent must still run if this fails (missing file,
-    no display, PyAV not installed, ...). Uses pythonw.exe when available so the
-    pet doesn't spawn its own console window."""
+def _launch_tray_app():
     import os
     import subprocess
-
     base = os.path.dirname(os.path.abspath(__file__))
-    script = os.path.join(base, "video_pet.py")
+    script = os.path.join(base, "tray_app.py")
     if not os.path.exists(script):
         return
     exe = sys.executable
@@ -1168,56 +246,64 @@ def _launch_video_pet():
     if os.path.exists(pyw):
         exe = pyw
     try:
-        # Pass our pid so the (interactive-but-un-closeable) pet exits when
-        # the agent does.
-        subprocess.Popen([exe, script, "--parent-pid", str(os.getpid())], cwd=base)
+        subprocess.Popen([exe, script], cwd=base)
     except OSError:
         pass
 
 
 def main():
-    # Windows terminals default to a legacy code page (cp1252) that can't
-    # encode the emoji / ✓ / ⚠ characters this app prints for status — which
-    # otherwise crashes with UnicodeEncodeError mid-command (e.g. when the
-    # resolver prints "✓ Found in cache" while executing a voice command).
-    # Force UTF-8 so output is safe in any terminal.
-    for _stream in (sys.stdout, sys.stderr):
-        try:
-            _stream.reconfigure(encoding="utf-8", errors="replace")
-        except (AttributeError, ValueError):
-            pass
-
     parser = argparse.ArgumentParser(description="Personal Agent")
-    parser.add_argument(
-        "--voice",
-        action="store_true",
-        help="Run in voice mode (wake word + speech-to-text + text-to-speech) instead of typed commands.",
-    )
-    parser.add_argument(
-        "--mic",
-        type=int,
-        default=None,
-        metavar="INDEX",
-        help="Microphone device index to listen through (see --list-mics). "
-             "Default: whatever Windows reports as the default input device.",
-    )
-    parser.add_argument(
-        "--list-mics",
-        action="store_true",
-        help="List available microphone input devices with their indices, then exit.",
-    )
+    parser.add_argument("--voice", action="store_true")
+    parser.add_argument("--mic", type=int, default=None)
+    parser.add_argument("--list-mics", action="store_true")
+    parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--verbosity", choices=["terse", "detailed"], default=None)
+    parser.add_argument("--terse", action="store_true")
+    parser.add_argument("--detailed", action="store_true")
+    parser.add_argument("--list-voices", action="store_true")
+    parser.add_argument("--tts-voice", type=str, default=None)
+    parser.add_argument("--tts-rate", type=int, default=None)
+    parser.add_argument("--train", "--training", action="store_true")
+    parser.add_argument("--tray", action="store_true")
     args = parser.parse_args()
 
-    # Both of these need the audio stack, so import voice_io lazily — typed-mode
-    # users shouldn't need speech deps installed just to run the agent.
+    if args.dry_run:
+        config.set("safety.dry_run", True, persist=False)
+        print("🛡️ Safety: Running in DRY-RUN mode (actions will be logged, not executed).")
+
+    if args.verbosity:
+        config.set("ux.verbosity", args.verbosity, persist=False)
+    elif args.terse:
+        config.set("ux.verbosity", "terse", persist=False)
+    elif args.detailed:
+        config.set("ux.verbosity", "detailed", persist=False)
+
+    if args.train:
+        config.set("safety.training_mode", True, persist=False)
+        print("🧠 Training Mode enabled: corrections and active learning are active.")
+
+    if args.list_voices:
+        import voice_io
+        voice_io.print_available_voices()
+        return
+
+    if args.tts_voice:
+        import voice_io
+        res = voice_io.set_tts_voice(args.tts_voice)
+        print(f"🎙️ {res}")
+
+    if args.tts_rate:
+        import voice_io
+        res = voice_io.set_tts_rate(args.tts_rate)
+        print(f"🎙️ {res}")
+
     if args.list_mics:
         import voice_io
         voice_io.print_input_devices()
         return
 
-    # Kick off the looping corner video pet as soon as the agent starts (its
-    # audio plays once; the visuals loop). Best-effort — never blocks the agent.
-    _launch_video_pet()
+    if args.tray:
+        _launch_tray_app()
 
     if args.voice:
         if args.mic is not None:

@@ -1,3 +1,6 @@
+import actions
+import action_registry
+import intent_resolver
 """
 test_move_file_validation.py
 
@@ -13,7 +16,7 @@ print("=" * 60)
 
 # Test 1: move_file is in ALLOWED_ACTIONS
 print("\n1. Testing move_file in ALLOWED_ACTIONS...")
-assert "move_file" in agent.ALLOWED_ACTIONS, "move_file should be in ALLOWED_ACTIONS"
+assert "move_file" in action_registry.generate_allowed_set(), "move_file should be in ALLOWED_ACTIONS"
 print(f"   ✓ move_file is in ALLOWED_ACTIONS")
 
 # Test 2: Valid move_file action
@@ -23,7 +26,7 @@ action = {
     "source": "Documents/test.txt",
     "destination": "Desktop/test.txt"
 }
-valid, error = agent.validate_action(action)
+valid, error = intent_resolver.validate_action(action)
 assert valid is True, f"Expected valid=True, got: {valid}, error: {error}"
 print(f"   ✓ Valid move_file action passes validation")
 
@@ -33,7 +36,7 @@ action = {
     "action": "move_file",
     "destination": "Desktop/test.txt"
 }
-valid, error = agent.validate_action(action)
+valid, error = intent_resolver.validate_action(action)
 assert valid is False, f"Expected valid=False for missing source"
 assert "source" in error.lower(), f"Expected 'source' in error message, got: {error}"
 print(f"   ✓ Missing source rejected: {error}")
@@ -44,7 +47,7 @@ action = {
     "action": "move_file",
     "source": "Documents/test.txt"
 }
-valid, error = agent.validate_action(action)
+valid, error = intent_resolver.validate_action(action)
 assert valid is False, f"Expected valid=False for missing destination"
 assert "destination" in error.lower(), f"Expected 'destination' in error message, got: {error}"
 print(f"   ✓ Missing destination rejected: {error}")
@@ -56,7 +59,7 @@ action = {
     "source": "",
     "destination": "Desktop/test.txt"
 }
-valid, error = agent.validate_action(action)
+valid, error = intent_resolver.validate_action(action)
 assert valid is False, f"Expected valid=False for empty source"
 assert "source" in error.lower(), f"Expected 'source' in error message, got: {error}"
 print(f"   ✓ Empty source rejected: {error}")
@@ -68,7 +71,7 @@ action = {
     "source": "Documents/test.txt",
     "destination": ""
 }
-valid, error = agent.validate_action(action)
+valid, error = intent_resolver.validate_action(action)
 assert valid is False, f"Expected valid=False for empty destination"
 assert "destination" in error.lower(), f"Expected 'destination' in error message, got: {error}"
 print(f"   ✓ Empty destination rejected: {error}")
@@ -82,7 +85,7 @@ action = {
         {"action": "move_file", "source": "a.txt", "destination": "b.txt"}
     ]
 }
-valid, error = agent.validate_action(action)
+valid, error = intent_resolver.validate_action(action)
 assert valid is True, f"Expected valid=True for sequence with move_file, got error: {error}"
 print(f"   ✓ Sequence with move_file passes validation")
 
@@ -95,7 +98,7 @@ action = {
         {"action": "move_file", "source": "a.txt"}  # missing destination
     ]
 }
-valid, error = agent.validate_action(action)
+valid, error = intent_resolver.validate_action(action)
 assert valid is False, f"Expected valid=False for sequence with invalid move_file"
 assert "step 2" in error.lower() or "move_file" in error.lower(), f"Expected step/action info in error, got: {error}"
 print(f"   ✓ Sequence with invalid move_file rejected: {error}")

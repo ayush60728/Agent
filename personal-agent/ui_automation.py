@@ -320,3 +320,12 @@ if __name__ == "__main__":
     print(f"query      : {q!r}")
     print(f"candidates : {_candidates(q)}")
     print(f"match      : {find_control_center(q)}")
+
+
+def get_control_from_point(x: int, y: int):
+    """Return the UIA control at the specified screen coordinates, or None."""
+    try:
+        import uiautomation as auto
+        return auto.ControlFromPoint(x, y)
+    except Exception:
+        return None

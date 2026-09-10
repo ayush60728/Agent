@@ -1,3 +1,5 @@
+import intent_resolver
+import action_registry
 """
 test_disambiguation.py
 
@@ -9,7 +11,7 @@ Ollama, no screen, no cache writes:
   * interpret is pure;
   * the integration cases drive agent.process_command() with a monkeypatched
     prompt cache (so "click submit" resolves WITHOUT the LLM) and a
-    monkeypatched agent.execute_action recorder that returns an AmbiguousClick
+    monkeypatched action_registry.execute recorder that returns an AmbiguousClick
     for click_text (so nothing is actually clicked).
 
 Run with the project venv:
@@ -164,8 +166,9 @@ def _recorder(action):
 
 # Route "click submit" through the cache (no LLM); real builtins still handle
 # "scroll down". execute_action is the recorder, so nothing is really clicked.
-agent.execute_action = _recorder
-agent.get_cached_action = (
+_original_execute = getattr(action_registry, "_original_execute", action_registry.execute)
+action_registry.execute = _recorder
+intent_resolver.get_cached_action = (
     lambda text: {"action": "click_text", "target": "submit"}
     if text.strip().lower() == "click submit" else None
 )
@@ -234,10 +237,11 @@ check("expired -> no pick target", disambiguation.pending(), None)
 
 
 # --- 5. real click_text -> execute_action passthrough ---------------------
-# Section 4 mocked agent.execute_action, so the REAL path that *produces* an
-# AmbiguousClick (actions.execute_action -> desktop_actions.click_text ->
+# Section 4 mocked action_registry.execute, so the REAL path that *produces* an
+# AmbiguousClick (action_registry.execute -> desktop_actions.click_text ->
 # _build_ambiguous) was untested. Drive it here with matches injected and the
 # screen neutralized: no focus check, no real click, no color sampling.
+action_registry.execute = _original_execute
 print("\n5. execute_action -> click_text -> AmbiguousClick (real path)")
 
 actions._ensure_focused_app_active = lambda: None          # pretend an app is focused
@@ -254,7 +258,7 @@ _INJECT[:] = [
     _M(150, 120, (100, 100, 100, 40), 0.95, True),
     _M(150, 620, (100, 600, 100, 40), 0.95, True),
 ]
-res = actions.execute_action({"action": "click_text", "target": "submit"})
+res = action_registry.execute({"action": "click_text", "target": "submit"})
 check_true("2 matches -> AmbiguousClick", isinstance(res, disambiguation.AmbiguousClick))
 check("AmbiguousClick has 2 candidates", len(res.candidates) if isinstance(res, disambiguation.AmbiguousClick) else -1, 2)
 check_true("candidates carry a position desc",
@@ -262,12 +266,12 @@ check_true("candidates carry a position desc",
 
 # one match -> a normal click result string (no prompt)
 _INJECT[:] = [_M(150, 120, (100, 100, 100, 40), 0.95, True)]
-res = actions.execute_action({"action": "click_text", "target": "submit"})
+res = action_registry.execute({"action": "click_text", "target": "submit"})
 check_true("1 match -> result string", isinstance(res, str))
 check_contains("1 match -> clicked", res, "clicked")
 
 # the internal click_at action dispatches through execute_action
-res = actions.execute_action({"action": "click_at", "x": 7, "y": 9, "label": "the 'x'"})
+res = action_registry.execute({"action": "click_at", "x": 7, "y": 9, "label": "the 'x'"})
 check_contains("click_at -> clicked at coords", res, "(7, 9)")
 
 

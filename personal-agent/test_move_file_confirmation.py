@@ -55,8 +55,10 @@ print(f"   ✓ Sequence with move_file requires confirmation")
 print("\n5. Testing actions that don't require confirmation...")
 safe_actions = [
     {"action": "open_app", "target": "notepad"},
-    {"action": "copy_file", "source": "a.txt", "destination": "b.txt"},
+    {"action": "open_folder", "target": "Documents"},
     {"action": "click_text", "target": "submit"},
+    {"action": "scroll", "target": "down"},
+    {"action": "wait", "target": 1},
 ]
 for action in safe_actions:
     needs_conf = confirmation.needs_confirmation(action)

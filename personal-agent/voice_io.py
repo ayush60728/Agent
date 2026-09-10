@@ -35,6 +35,11 @@ from faster_whisper import WhisperModel
 
 import confirmation  # so a yes/no answer isn't swallowed by the local cancel shortcut
 import disambiguation  # likewise, so a pick ("two", "the top one") isn't swallowed
+import app_switch  # likewise, so a bare app name can answer "which app?"
+import cancel_token
+import config
+import health_monitor
+from retry import with_retry, RetryExhausted
 
 WAKE_WORD = "agent"
 WAKE_WORD_ALIASES = {
@@ -53,6 +58,17 @@ COMMAND_START_WORDS = {
     "switch",
     "focus",
     "click",
+    "right",
+    "search",
+    "play",
+    "pause",
+    "resume",
+    "next",
+    "previous",
+    "volume",
+    "close",
+    "quit",
+    "scroll",
     "type",
     "press",
     "wait",
@@ -122,15 +138,97 @@ _whisper_model = WhisperModel("base.en", device="cpu", compute_type="int8")
 
 _tts_engine = pyttsx3.init()
 
-# pyttsx3 defaults to ~200 wpm, which sounds rushed and clipped. Slowing it a
-# touch makes replies noticeably clearer. Best-effort — never let a TTS
-# property quirk stop the engine from initialising.
-try:
-    _tts_engine.setProperty("rate", 175)
-except Exception:
-    pass
+def _configure_tts():
+    """Apply rate, volume, and voice from config to _tts_engine."""
+    try:
+        rate = getattr(config, "TTS_RATE", 175)
+        _tts_engine.setProperty("rate", rate)
+    except Exception:
+        pass
+
+    try:
+        vol = getattr(config, "TTS_VOLUME", 1.0)
+        _tts_engine.setProperty("volume", vol)
+    except Exception:
+        pass
+
+    voice_id = getattr(config, "TTS_VOICE_ID", None)
+    if voice_id:
+        try:
+            _tts_engine.setProperty("voice", voice_id)
+        except Exception:
+            pass
+
+_configure_tts()
 
 _tts_lock = threading.Lock()  # pyttsx3 isn't safe to call from multiple threads at once
+
+
+def get_available_voices() -> list[dict]:
+    """Return a list of installed SAPI5 / TTS voices with id, name, and languages."""
+    voices_info = []
+    try:
+        for v in _tts_engine.getProperty("voices"):
+            voices_info.append({
+                "id": v.id,
+                "name": v.name,
+                "languages": getattr(v, "languages", []),
+                "gender": getattr(v, "gender", None),
+                "age": getattr(v, "age", None),
+            })
+    except Exception:
+        pass
+    return voices_info
+
+
+def set_tts_voice(voice_name_or_id: str) -> str:
+    """Set the active TTS voice by exact ID or substring name match (case-insensitive)."""
+    target = voice_name_or_id.lower().strip()
+    try:
+        voices = _tts_engine.getProperty("voices")
+        matched = None
+        for v in voices:
+            if target == v.id.lower() or target in v.name.lower():
+                matched = v
+                break
+        if matched:
+            _tts_engine.setProperty("voice", matched.id)
+            config.TTS_VOICE_ID = matched.id
+            return f"Set voice to {matched.name}"
+        return f"Voice '{voice_name_or_id}' not found. Say 'list voices' to see available options."
+    except Exception as e:
+        return f"Could not set voice: {e}"
+
+
+def set_tts_rate(rate: int) -> str:
+    """Set speaking speed in words per minute (e.g. 150 = slow, 175 = normal, 210 = fast)."""
+    try:
+        rate = max(80, min(350, int(rate)))
+        _tts_engine.setProperty("rate", rate)
+        config.TTS_RATE = rate
+        return f"Set speech rate to {rate} wpm"
+    except Exception as e:
+        return f"Could not set speech rate: {e}"
+
+
+def set_tts_volume(volume: float) -> str:
+    """Set volume from 0.0 to 1.0."""
+    try:
+        vol = max(0.0, min(1.0, float(volume)))
+        _tts_engine.setProperty("volume", vol)
+        config.TTS_VOLUME = vol
+        return f"Set volume to {int(vol * 100)}%"
+    except Exception as e:
+        return f"Could not set volume: {e}"
+
+
+def print_available_voices():
+    """Print all available voices formatted for CLI output."""
+    voices = get_available_voices()
+    print("Available TTS voices:\n")
+    for i, v in enumerate(voices):
+        print(f"  [{i}] {v['name']} (ID: {v['id']})")
+    print("\nChange voice with: python agent.py --tts-voice <name_or_id>")
 
 
 # Words that mean "abort, I didn't actually want anything" after the wake
@@ -279,12 +377,32 @@ def _listen_on_source(
 
     The source is opened once by the caller and reused across calls, so there's
     no gap between phrases where speech could be missed (re-opening the device
-    every loop, as the old code did, dropped the first moment of each utterance)."""
+    every loop, as the old code did, dropped the first moment of each utterance).
+
+    _transcribe() is wrapped with with_retry (up to 2 attempts, 12s timeout per
+    attempt) so a stalled or corrupt Whisper pass is retried before the error
+    count rises.  Health ticks are recorded so health_monitor can trigger a mic
+    recalibrate if failures accumulate.
+    """
     try:
         audio = recognizer.listen(source, timeout=timeout, phrase_time_limit=phrase_time_limit)
     except sr.WaitTimeoutError:
         return None
-    return _transcribe(audio)
+
+    try:
+        result = with_retry(
+            lambda: _transcribe(audio),
+            retries=2,
+            base_delay=0.5,
+            timeout=12,
+            label="Whisper transcribe",
+        )
+        health_monitor.record_voice_tick(ok=True)
+        return result
+    except (RetryExhausted, TimeoutError) as exc:
+        health_monitor.record_voice_tick(ok=False)
+        print(f"[VOICE] transcription failed after retries: {exc}")
+        return ""
 
 
 def _drain(source: sr.AudioSource) -> None:
@@ -493,6 +611,7 @@ def voice_loop(on_command):
         else:
             print("(microphone changed — reconnected to the new default input device)")
 
+        health_monitor.reset_voice_health()
         _write_state("idle")
         print(f"Listening for wake word '{WAKE_WORD}'... (Ctrl+C to stop)\n")
 
@@ -515,9 +634,14 @@ def voice_loop(on_command):
                 # wake-word gate below and the question can never be answered by
                 # voice: the agent asks, then looks like it ignored you. (You'd
                 # have had to say "agent yes", which nobody knows to do.)
-                if confirmation.is_pending() or disambiguation.is_pending():
+                if confirmation.is_pending() or disambiguation.is_pending() or app_switch.is_pending():
                     _write_state("listening")
-                    waiting_for = "yes or no" if confirmation.is_pending() else "your pick"
+                    if confirmation.is_pending():
+                        waiting_for = "yes or no"
+                    elif disambiguation.is_pending():
+                        waiting_for = "your pick"
+                    else:
+                        waiting_for = "the app name"
                     try:
                         answer = _listen_on_source(
                             recognizer, source, phrase_time_limit=6,
@@ -610,6 +734,15 @@ def voice_loop(on_command):
                     # heartbeat going, and periodically confirm we're still on
                     # the current Windows default device.
                     _heartbeat()
+
+                    # Proactive health monitor check: if error rate is high, recalibrate.
+                    if health_monitor.needs_recalibrate():
+                        print(
+                            f"\n(health monitor requested mic recalibrate — reconnecting…)"
+                        )
+                        need_reopen = True
+                        break
+
                     ticks_since_check += 1
                     if (
                         MIC_DEVICE_INDEX is None
@@ -651,6 +784,7 @@ def voice_loop(on_command):
                         continue  # not addressed to us — stay idle, keep listening
 
                 _write_state("listening")
+                cancel_token.GLOBAL_TOKEN.cancel()
                 _chirp()  # audible "I heard you" the instant the wake word lands
 
                 # "agent open brave" — command already in the same utterance.
@@ -698,6 +832,7 @@ def voice_loop(on_command):
 
                 if (not confirmation.is_pending()
                         and not disambiguation.is_pending()
+                        and not app_switch.is_pending()
                         and _is_cancel(command_text)):
                     # "never mind" / "cancel" — abort quietly, no LLM call.
                     # Skipped while a destructive action is awaiting yes/no or a
