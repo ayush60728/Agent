@@ -489,9 +489,19 @@ def _build_ambiguous(locate, candidates, button: str = "left"):
     return disambiguation.AmbiguousClick(text=locate, candidates=cand_dicts)
 
 
+def _human_move_to(tx, ty):
+    """Move the mouse to target coordinates smoothly like a human."""
+    import math
+    cx, cy = pyautogui.position()
+    distance = math.hypot(tx - cx, ty - cy)
+    # Dynamic duration based on distance: base 0.1s + up to 0.5s for long distances
+    duration = max(0.1, min(0.6, (distance / 3000.0) + 0.1))
+    pyautogui.moveTo(tx, ty, duration=duration, tween=pyautogui.easeInOutQuad)
+
 def _do_click(pos, label, button: str = "left") -> str:
     """Click and invalidate the OCR cache — the screen state has changed."""
-    pyautogui.click(pos[0], pos[1], button=button)
+    _human_move_to(pos[0], pos[1])
+    pyautogui.click(button=button)
     ocr_cache.CACHE.invalidate_all()
     prefix = "right-clicked" if button == "right" else "clicked"
     return f"{prefix} {label} at {pos}"
@@ -501,7 +511,8 @@ def click_at(x, y, label="that", button: str = "left") -> str:
     """Click an absolute screen coordinate the user chose during
     disambiguation. Separate from _do_click so the disambiguation handler can
     construct a click straight from a candidate's stored (x, y)."""
-    pyautogui.click(x, y, button=button)
+    _human_move_to(x, y)
+    pyautogui.click(button=button)
     ocr_cache.CACHE.invalidate_all()
     prefix = "right-clicked" if button == "right" else "clicked"
     return f"{prefix} {label} at ({x}, {y})"
@@ -509,7 +520,7 @@ def click_at(x, y, label="that", button: str = "left") -> str:
 
 def move_to(x, y, label="that") -> str:
     """Move the cursor to a candidate without clicking it."""
-    pyautogui.moveTo(x, y)
+    _human_move_to(x, y)
     return f"pointing at {label} at ({x}, {y})"
 
 
@@ -628,7 +639,7 @@ def scroll(direction: str, clicks: int = SCROLL_STEP) -> str:
     if active is not None and active.width > 0 and active.height > 0:
         cx = active.left + active.width // 2
         cy = active.top + active.height // 2
-        pyautogui.moveTo(cx, cy)
+        _human_move_to(cx, cy)
 
     pyautogui.scroll(amount)
     # Scrolling changes the visible content — invalidate OCR cache.

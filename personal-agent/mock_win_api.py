@@ -213,7 +213,7 @@ class MockPyAutoGUI:
     def position(self) -> Tuple[int, int]:
         return self.cursor_pos
 
-    def moveTo(self, x: int, y: int, duration: float = 0.0) -> None:
+    def moveTo(self, x: int, y: int, duration: float = 0.0, **kwargs) -> None:
         self.cursor_pos = (x, y)
         self.mouse_moves.append((x, y))
 
